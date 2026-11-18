@@ -42,6 +42,7 @@
   <div id="start">
     <h1>AR-рулетка</h1>
     <p>Тест точности на ARCore. Нужен Chrome на Android, свет и поверхности с фактурой.</p>
+    <p style="text-align:left">Как держать телефон: на расстоянии <b>0,5–3 м</b> от измеряемой поверхности, камерой <b>прямо на неё</b> (не вскользь), двигайся плавно. Сначала 5–10 секунд поводи камерой: появятся полупрозрачные плоскости (зелёные — вертикальные, синие — горизонтальные). Метка должна лежать на плоскости, которую ты измеряешь.</p>
     <div class="row">
       <label>Поправочный коэффициент <input type="number" id="scale" step="0.001" value="1"></label>
     </div>
@@ -52,6 +53,7 @@
   <div id="hud">
     <div id="top">
       <div id="live">Наведи на поверхность</div>
+      <div id="qual" style="font-size:13px;white-space:pre-line"></div>
       <div id="info"></div>
       <div id="dbg" style="font:11px monospace;color:#7d8794;white-space:pre-wrap"></div>
     </div>
@@ -63,10 +65,16 @@
       <button data-d="left">◀</button><button id="step" class="sec">шаг 10 мм</button><button data-d="right">▶</button>
       <button id="prevPt" class="sec">‹ точка</button><button data-d="back">▼ назад</button><button id="nextPt" class="sec">точка ›</button>
     </div>
+    <div id="cfg" class="padgrid" style="display:none;grid-template-columns:1fr 1fr">
+      <button class="sec" id="cfgPlanes">Плоскости: видны</button>
+      <button class="sec" id="cfgHit">Ловить: плоск.+точки</button>
+      <button class="sec" id="cfgAnch">Якоря: выкл</button>
+      <button class="sec" id="cfgDepth">Точка по: поверхности</button>
+    </div>
     <div id="bottom">
       <button id="put">＋ Поставить точку</button>
       <button class="sec" id="nudge">Подстройка</button>
-      <button class="sec" id="hitMode">Привязка: плоск.+точки</button>
+      <button class="sec" id="cfgBtn">⚙ Настройки</button>
       <button class="sec active" id="mDist">Длина</button>
       <button class="sec" id="mRoom">Комната</button>
       <button class="sec" id="mPart">Деталь</button>
@@ -191,6 +199,13 @@ const OPNAME = { door: 'Дверь', window: 'Окно' };
 
 // ---------- WebXR ----------
 let session = null, hitSource = null, hitRequested = false, placeReq = false, anchDirty = false;
+let useAnchors = false;      // якоря по умолчанию выкл: метки жёстко стоят в системе координат сессии
+let useDepth = false;        // ставить точку по карте глубины вместо hit-test
+let showPlanes = true, depthOn = false, planesSupported = false;
+const planeMeshes = new Map();   // XRPlane -> {root, mat, base, poly, orientation, w, h, m, inv, normal, t}
+let curPlane = null;
+const camPos = new THREE.Vector3(), camDir = new THREE.Vector3(0, 0, -1);
+let camOK = false, trackingLost = false;
 const hitPos = new THREE.Vector3();
 
 async function start() {
@@ -198,13 +213,18 @@ async function start() {
   if (!navigator.xr) { $('err').textContent = 'WebXR недоступен. Нужен Chrome на Android и HTTPS.'; return; }
   const ok = await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
   if (!ok) { $('err').textContent = 'immersive-ar не поддерживается (нет ARCore / «Службы Google Play для AR»?).'; return; }
+  const full = {
+    requiredFeatures: ['hit-test'],
+    optionalFeatures: ['dom-overlay', 'local-floor', 'anchors', 'plane-detection', 'depth-sensing'],
+    domOverlay: { root: ui },
+    depthSensing: { usagePreference: ['cpu-optimized', 'gpu-optimized'], dataFormatPreference: ['luminance-alpha', 'float32'] }
+  };
+  const basic = { requiredFeatures: ['hit-test'], optionalFeatures: ['dom-overlay', 'local-floor'], domOverlay: { root: ui } };
   try {
-    session = await navigator.xr.requestSession('immersive-ar', {
-      requiredFeatures: ['hit-test'],
-      optionalFeatures: ['dom-overlay', 'local-floor', 'anchors'],
-      domOverlay: { root: ui }
-    });
+    try { session = await navigator.xr.requestSession('immersive-ar', full); }
+    catch (e1) { session = await navigator.xr.requestSession('immersive-ar', basic); }   // если телефон не принял доп. функции
   } catch (e) { $('err').textContent = 'Не удалось запустить: ' + e.message; return; }
+  depthOn = !!session.depthUsage;
   renderer.xr.setReferenceSpaceType('local');
   await renderer.xr.setSession(session);
   resetAll();                                  // новая AR-сессия = новая система координат, старые точки не годятся
@@ -220,7 +240,9 @@ async function start() {
 }
 
 function onEnd() {
-  session = null; hitSource = null; hitRequested = false;
+  session = null; hitSource = null; hitRequested = false; depthOn = false;
+  planeMeshes.forEach(r => scene.remove(r.root)); planeMeshes.clear(); curPlane = null;
+  $('qual').textContent = '';
   reticle.visible = false; liveLine.visible = false;
   $('hud').style.display = 'none';
   $('hud2').style.display = 'none';
@@ -231,6 +253,118 @@ function onEnd() {
   $('json').value = JSON.stringify(s.json, null, 1);
   $('result').style.display = 'block';
   fitPlan();
+}
+
+// ---------- камера, плоскости, глубина, качество ----------
+function readCamera(frame, ref) {
+  const vp = frame.getViewerPose(ref);
+  if (!vp) { camOK = false; return null; }
+  const p = vp.transform.position, o = vp.transform.orientation;
+  camPos.set(p.x, p.y, p.z);
+  camDir.set(0, 0, -1).applyQuaternion(new THREE.Quaternion(o.x, o.y, o.z, o.w));
+  camOK = true; trackingLost = !!vp.emulatedPosition;
+  return vp;
+}
+
+function readDepth(frame, vp) {                 // расстояние до реальной геометрии по центру кадра
+  if (!vp || !depthOn || !vp.views.length) return null;
+  try {
+    const di = frame.getDepthInformation(vp.views[0]);
+    if (!di) return null;
+    const d = di.getDepthInMeters(0.5, 0.5);
+    if (!(d > 0.05 && d < 15)) return null;
+    return { d, pos: camPos.clone().addScaledVector(camDir, d) };
+  } catch (e) { return null; }
+}
+
+function buildPlane(plane) {
+  const poly = Array.from(plane.polygon, p => ({ x: p.x, z: p.z }));
+  const base = plane.orientation === 'vertical' ? 0x22c55e : 0x3b82f6;
+  const geo = new THREE.ShapeGeometry(new THREE.Shape(poly.map(p => new THREE.Vector2(p.x, p.z)))).rotateX(Math.PI / 2);
+  const mat = new THREE.MeshBasicMaterial({ color: base, transparent: true, opacity: 0.14, side: THREE.DoubleSide, depthWrite: false });
+  const edge = poly.map(p => new THREE.Vector3(p.x, 0, p.z)); edge.push(edge[0]);
+  const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(edge), new THREE.LineBasicMaterial({ color: base }));
+  const root = new THREE.Group(); root.add(new THREE.Mesh(geo, mat), line); root.matrixAutoUpdate = false;
+  const xs = poly.map(p => p.x), zs = poly.map(p => p.z);
+  return { root, mat, base, poly, orientation: plane.orientation, w: Math.max(...xs) - Math.min(...xs), h: Math.max(...zs) - Math.min(...zs),
+    m: new THREE.Matrix4(), inv: new THREE.Matrix4(), normal: new THREE.Vector3(0, 1, 0), t: -1 };
+}
+
+function syncPlanes(frame, ref) {
+  const set = frame.detectedPlanes;
+  planesSupported = !!set;
+  if (!set) return;
+  for (const [plane, rec] of [...planeMeshes]) if (!set.has(plane)) { scene.remove(rec.root); planeMeshes.delete(plane); }
+  set.forEach(plane => {
+    const pose = frame.getPose(plane.planeSpace, ref);
+    if (!pose) return;
+    let rec = planeMeshes.get(plane);
+    if (!rec || rec.t !== plane.lastChangedTime) {
+      if (rec) scene.remove(rec.root);
+      rec = buildPlane(plane); rec.t = plane.lastChangedTime;
+      planeMeshes.set(plane, rec); scene.add(rec.root);
+    }
+    rec.m.fromArray(pose.transform.matrix); rec.inv.copy(rec.m).invert();
+    rec.normal.setFromMatrixColumn(rec.m, 1).normalize();
+    rec.root.matrix.copy(rec.m); rec.root.matrixWorldNeedsUpdate = true;
+    rec.root.visible = showPlanes;
+  });
+}
+
+function inPoly(x, z, poly) {
+  let c = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i], b = poly[j];
+    if ((a.z > z) !== (b.z > z) && x < (b.x - a.x) * (z - a.z) / (b.z - a.z) + a.x) c = !c;
+  }
+  return c;
+}
+
+function planeAtHit(p) {                         // плоскость, на которой лежит кольцо
+  let best = null, bd = 0.04;
+  planeMeshes.forEach(rec => {
+    const l = p.clone().applyMatrix4(rec.inv);
+    if (Math.abs(l.y) < bd && inPoly(l.x, l.z, rec.poly)) { bd = Math.abs(l.y); best = rec; }
+  });
+  return best;
+}
+
+const QCOL = ['#8be3b8', '#fbbf24', '#f87171'], RCOL = [0x19a974, 0xf59e0b, 0xef4444];
+function updateQuality(dp, fromTest) {
+  const lines = []; let lvl = 0; const bump = l => { if (l > lvl) lvl = l; };
+  if (trackingLost) { lines.push('⚠ трекинг потерян: медленно покачай телефоном'); bump(2); }
+  let dist = null;
+  if (camOK) {
+    dist = camPos.distanceTo(hitPos);
+    const ds = dist.toFixed(2) + ' м';
+    if (dist < 0.4) { lines.push('до точки ' + ds + ': слишком близко, отодвинься (нужно 0,5–3 м)'); bump(1); }
+    else if (dist > 4) { lines.push('до точки ' + ds + ': далеко, точность падает (нужно 0,5–3 м)'); bump(dist > 6 ? 2 : 1); }
+    else lines.push('до точки ' + ds + ': расстояние хорошее');
+  }
+  curPlane = null;
+  if (planesSupported) {
+    const rec = planeAtHit(hitPos);
+    curPlane = rec;
+    if (rec) {
+      lines.push('плоскость: ' + (rec.orientation === 'vertical' ? 'вертикальная' : 'горизонтальная') + ', ' + rec.w.toFixed(1) + '×' + rec.h.toFixed(1) + ' м');
+      if (camOK) {
+        const dir = hitPos.clone().sub(camPos).normalize();
+        const ang = Math.acos(Math.min(1, Math.abs(rec.normal.dot(dir)))) * 180 / Math.PI;
+        if (ang > 65) { lines.push('луч идёт вскользь (' + Math.round(ang) + '° от нормали): встань напротив плоскости'); bump(1); }
+      }
+    } else { lines.push('под кольцом нет плоскости (опорная точка): может сместиться, найди плоскость'); bump(1); }
+  } else lines.push('плоскости на этом телефоне недоступны');
+  if (dp && fromTest && camOK) {
+    const dh = camPos.distanceTo(fromTest);
+    if (Math.abs(dp.d - dh) > Math.max(0.12, 0.08 * dh)) { lines.push('⚠ глубина по камере ' + dp.d.toFixed(2) + ' м, а точка на ' + dh.toFixed(2) + ' м: возможно за предметом'); bump(1); }
+    else lines.push('глубина совпадает с поверхностью');
+  }
+  $('qual').textContent = lines.join('\n'); $('qual').style.color = QCOL[lvl];
+  reticle.material.color.setHex(RCOL[lvl]);
+  planeMeshes.forEach(rec => {                   // подсветка плоскости, которую меряем
+    const cur = rec === curPlane;
+    rec.mat.opacity = cur ? 0.4 : 0.14; rec.mat.color.setHex(cur ? 0xfacc15 : rec.base);
+  });
 }
 
 // положения точек берём у якорей ARCore (если они есть), чтобы метки не «плыли» относительно предметов
@@ -252,26 +386,42 @@ renderer.setAnimationLoop((t, frame) => {
     const ref = renderer.xr.getReferenceSpace();
     if (!hitRequested) { hitRequested = true; requestHit(); }
     syncAnchors(frame, ref);
+    const vp = readCamera(frame, ref);
+    syncPlanes(frame, ref);
+    const dp = readDepth(frame, vp);
     if (++frames % 20 === 0) {
       const na = [...pts, ...cp, opTmp, ...ops.flatMap(o => [o.a, o.b])].filter(p => p && p._anchor).length;
-      dbgState = 'кадры ' + frames + ' hit=' + !!hitSource + ' кольцо=' + reticle.visible + ' точек=' + pts.length + ' якорей=' + na + ' типы=' + hitTypes.join('+');
+      dbgState = 'кадры ' + frames + ' hit=' + !!hitSource + ' кольцо=' + reticle.visible + ' точек=' + pts.length + ' якорей=' + na +
+        ' плоскостей=' + (planesSupported ? planeMeshes.size : 'нет') + ' глубина=' + (depthOn ? (dp ? dp.d.toFixed(2) : 'нет данных') : 'нет') + ' типы=' + hitTypes.join('+');
       dbg();
     }
     if (anchDirty && frames % 6 === 0) { anchDirty = false; redraw(); }
     if (hitSource) {
       const res = frame.getHitTestResults(hitSource);
+      let fromTest = null, usedDepth = false;
       if (res.length) {
         const pose = res[0].getPose(ref);
         reticle.visible = true;
         reticle.matrix.fromArray(pose.transform.matrix);
         hitPos.setFromMatrixPosition(reticle.matrix);
-        updateLive();
-        if (placeReq) { placeReq = false; doPlace(res[0]); }
+        fromTest = hitPos.clone();
+        if (useDepth && dp) { hitPos.copy(dp.pos); reticle.matrix.setPosition(hitPos); usedDepth = true; }
+      } else if (useDepth && dp) {
+        reticle.visible = true; hitPos.copy(dp.pos); reticle.matrix.makeTranslation(hitPos.x, hitPos.y, hitPos.z); usedDepth = true;
       } else {
         reticle.visible = false;
+      }
+      reticle.matrixWorldNeedsUpdate = true;
+      if (reticle.visible) {
+        updateQuality(dp, fromTest);
+        updateLive();
+        if (placeReq) { placeReq = false; doPlace(usedDepth ? null : res[0]); }
+      } else {
         liveLine.visible = false;
         placeReq = false;
         $('live').textContent = 'Наведи на поверхность';
+        $('qual').textContent = trackingLost ? '⚠ трекинг потерян: медленно покачай телефоном' : 'ищу поверхность: поводи камерой, ' + (planesSupported ? 'должны появиться плоскости' : 'на стену или пол');
+        $('qual').style.color = '#fbbf24';
       }
     }
   }
@@ -530,12 +680,11 @@ $('put').onclick = () => {
 
 // Точка «приклеивается» к реальному миру через якорь ARCore: при поправках трекинга она не уплывает
 function attach(v, hr) {
-  if (!hr || !hr.createAnchor) return;
+  if (!useAnchors || !hr || !hr.createAnchor) return;
   hr.createAnchor().then(a => { v._anchor = a; }).catch(err => dbg('якорь: ' + err.message));
 }
 function doPlace(hr) {
-  try { const e = new THREE.Vector3(); renderer.xr.getCamera().getWorldPosition(e); eyeSum.add(e); eyeN++; }
-  catch (err) { dbg('eye: ' + err.message); }
+  if (camOK) { eyeSum.add(camPos); eyeN++; }
   if (mode === 'room' && phase === 'ceil') {
     if (ci < pts.length) { cp[ci] = hitPos.clone(); attach(cp[ci], hr); sel = ci; ci++; redraw(); }
     return;
@@ -568,10 +717,29 @@ function requestHit() {
     .catch(err => { dbg('hit: ' + err.message); return session.requestHitTestSource({ space: vs }).then(s => { hitSource = s; }); });
   if (viewerSpace) go(viewerSpace); else session.requestReferenceSpace('viewer').then(vs => { viewerSpace = vs; go(vs); });
 }
-$('hitMode').onclick = () => {
+$('cfgBtn').onclick = () => {
+  const p = $('cfg');
+  p.style.display = p.style.display === 'none' ? 'grid' : 'none';
+  $('cfgBtn').classList.toggle('active', p.style.display !== 'none');
+};
+$('cfgPlanes').onclick = () => {
+  showPlanes = !showPlanes;
+  $('cfgPlanes').textContent = 'Плоскости: ' + (showPlanes ? 'видны' : 'скрыты');
+};
+$('cfgHit').onclick = () => {
   hitTypes = hitTypes.length === 2 ? ['plane'] : ['plane', 'point'];
-  $('hitMode').textContent = 'Привязка: ' + (hitTypes.length === 2 ? 'плоск.+точки' : 'плоскости');
+  $('cfgHit').textContent = 'Ловить: ' + (hitTypes.length === 2 ? 'плоск.+точки' : 'только плоскости');
   requestHit();
+};
+$('cfgAnch').onclick = () => {
+  useAnchors = !useAnchors;
+  if (!useAnchors) [...pts, ...cp, opTmp, ...ops.flatMap(o => [o.a, o.b])].forEach(p => { if (p) p._anchor = null; });
+  $('cfgAnch').textContent = 'Якоря: ' + (useAnchors ? 'вкл' : 'выкл');
+};
+$('cfgDepth').onclick = () => {
+  if (!depthOn) { $('live').textContent = 'Глубина недоступна на этом телефоне'; dbg('глубина недоступна'); return; }
+  useDepth = !useDepth;
+  $('cfgDepth').textContent = 'Точка по: ' + (useDepth ? 'глубине' : 'поверхности');
 };
 $('undo').onclick = () => {
   if (mode === 'room' && phase === 'ceil') { if (ci > 0) { ci--; cp[ci] = null; sel = ci - 1; } }
@@ -628,7 +796,7 @@ function nudge(dir) {
   }
   pts[sel]._anchor = null;                           // после ручной подстройки якорь больше не двигает точку
   const f = new THREE.Vector3();
-  try { renderer.xr.getCamera().getWorldDirection(f); } catch (err) { f.set(0, 0, -1); }
+  f.copy(camOK ? camDir : new THREE.Vector3(0, 0, -1));
   f.y = 0;
   if (f.lengthSq() < 1e-6) f.set(0, 0, -1);
   f.normalize();
