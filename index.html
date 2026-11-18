@@ -19,20 +19,21 @@
   button.active { background: #19a974; }
   #hud { display: none; }
   #top { padding: 10px; background: rgba(10,12,16,.72); }
-  #live { font-size: 22px; font-weight: 600; }
-  #info { font-size: 13px; color: #cfd6e0; white-space: pre-line; max-height: 28vh; overflow: auto; }
-  #bottom { padding: 10px; display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; background: rgba(10,12,16,.72); }
-  #bottom button { flex: 1 1 28%; }
-  #put { flex: 1 1 100% !important; padding: 18px; font-size: 20px; background: #f59e0b; color: #111; }
+  #live { font-size: 21px; font-weight: 600; }
+  #info { font-size: 13px; color: #cfd6e0; white-space: pre-line; max-height: 26vh; overflow: auto; }
+  #bottom { padding: 8px; display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; background: rgba(10,12,16,.72); }
+  #bottom button { flex: 1 1 22%; padding: 10px 4px; font-size: 14px; }
+  #bottom #put { flex: 1 1 60%; padding: 16px; font-size: 20px; background: #f59e0b; color: #111; }
+  #bottom #nudge { flex: 1 1 30%; }
   #result { display: none; padding: 12px; overflow: auto; flex: 1; min-height: 0; }
-  #plan { width: 100%; height: 52vh; display: block; border-radius: 12px; background: #0f1217; touch-action: none; }
+  #plan { width: 100%; height: 50vh; display: block; border-radius: 12px; background: #0f1217; touch-action: none; }
   .padgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; padding: 8px; background: rgba(10,12,16,.72); }
   .padgrid button { padding: 12px 4px; background: #3a4352; touch-action: manipulation; user-select: none; }
   .padgrid button.sec { background: #2b313b; font-size: 14px; }
-  textarea { width: 100%; height: 160px; background: #0c0e12; color: #cfe; border: 1px solid #333; border-radius: 8px; font: 12px monospace; }
+  textarea { width: 100%; height: 140px; background: #0c0e12; color: #cfe; border: 1px solid #333; border-radius: 8px; font: 12px monospace; }
   label { font-size: 14px; color: #a9b2bf; }
   input[type=number] { width: 110px; padding: 8px; border-radius: 8px; border: 1px solid #333; background: #0c0e12; color: #fff; font: inherit; }
-  .row { display: flex; gap: 8px; align-items: center; justify-content: center; margin: 10px 0; }
+  .row { display: flex; gap: 8px; align-items: center; justify-content: center; margin: 10px 0; flex-wrap: wrap; }
   #err { color: #ff8a8a; font-size: 14px; }
 </style>
 </head>
@@ -66,21 +67,29 @@
       <button class="sec" id="nudge">Подстройка</button>
       <button class="sec active" id="mDist">Длина</button>
       <button class="sec" id="mRoom">Комната</button>
-      <button class="sec" id="undo">Отмена</button>
+      <button class="sec" id="mPart">Деталь</button>
       <button class="sec" id="close">Замкнуть</button>
+      <button class="sec" id="newc">Новый контур</button>
+      <button class="sec" id="ceilBtn">Потолок</button>
+      <button class="sec" id="skip">Пропустить угол</button>
+      <button class="sec" id="undo">Отмена</button>
       <button class="sec" id="reset">Сброс</button>
       <button class="sec" id="exit">Выход</button>
     </div>
   </div>
 
   <div id="result">
-    <h2 style="margin:0 0 8px">План (вид сверху)</h2>
+    <h2 style="margin:0 0 8px">План</h2>
     <canvas id="plan"></canvas>
     <div class="row">
       <button class="sec" id="zin">＋</button>
       <button class="sec" id="zout">－</button>
       <button class="sec" id="zfit">По размеру</button>
-      <button class="sec" id="dxf">Скачать DXF</button>
+    </div>
+    <div class="row">
+      <button class="sec" id="dxf2">DXF 2D</button>
+      <button class="sec" id="dxf3">DXF 3D</button>
+      <button class="sec" id="obj">OBJ</button>
     </div>
     <div id="resText" style="white-space:pre-line"></div>
     <p><label>JSON (точки в мм)</label></p>
@@ -99,17 +108,31 @@ import * as THREE from 'three';
 
 const $ = id => document.getElementById(id);
 const ui = $('ui');
+const UP = new THREE.Vector3(0, 1, 0);
 
 // ---------- состояние ----------
-let mode = 'dist';      // dist | room
+let mode = 'dist';      // dist | room | part
 let pts = [];           // THREE.Vector3 (метры, система координат сессии)
-let closed = false;
+let closed = false;     // room: пол замкнут
+let cont = [{ idx: [], closed: false }];   // part: контуры (индексы в pts)
+let phase = 'floor';    // room: floor | ceil
+let cp = [];            // room: точки потолка над углами
+let ci = 0;             // room: следующий угол для потолка
+let sel = -1;           // выбранная точка для подстройки
+let stepMm = 10;
+const eyeSum = new THREE.Vector3(); let eyeN = 0;   // где стоял телефон (для ориентации плана детали)
+
 let scaleK = parseFloat(localStorage.getItem('scaleK') || '1') || 1;
 $('scale').value = scaleK;
 $('scale').addEventListener('change', () => {
   scaleK = parseFloat($('scale').value) || 1;
   localStorage.setItem('scaleK', scaleK);
 });
+
+function resetAll() {
+  pts = []; closed = false; cont = [{ idx: [], closed: false }];
+  phase = 'floor'; cp = []; ci = 0; sel = -1; eyeSum.set(0, 0, 0); eyeN = 0;
+}
 
 // ---------- three ----------
 const scene = new THREE.Scene();
@@ -140,10 +163,10 @@ scene.add(liveLine);
 
 const sphereGeom = new THREE.SphereGeometry(0.012, 16, 12);
 const sphereMat = new THREE.MeshBasicMaterial({ color: 0x19a974 });
+const ceilMat = new THREE.MeshBasicMaterial({ color: 0xc084fc });
 const selMat = new THREE.MeshBasicMaterial({ color: 0xf59e0b });
 const lineMat = new THREE.LineBasicMaterial({ color: 0x2d7ff9 });
-let sel = -1;           // индекс выбранной точки для подстройки
-let stepMm = 10;
+const ceilLineMat = new THREE.LineBasicMaterial({ color: 0xc084fc });
 
 // ---------- WebXR ----------
 let session = null, hitSource = null, hitRequested = false;
@@ -171,7 +194,7 @@ async function start() {
   $('hud2').style.display = 'block';
   ui.style.background = 'transparent';
   document.body.style.background = 'transparent';
-  update();
+  redraw();
 }
 
 function onEnd() {
@@ -187,136 +210,6 @@ function onEnd() {
   $('result').style.display = 'block';
   fitPlan();
 }
-
-// ---------- план сверху с зумом ----------
-const cv = $('plan'), cx = cv.getContext('2d');
-let view = { s: 100, ox: 0, oy: 0 };       // px на метр, смещение в px
-
-function planPts() { return pts.map(p => ({ x: p.x * scaleK, y: p.z * scaleK, h: p.y * scaleK })); }
-
-function resizeCanvas() {
-  const dpr = devicePixelRatio || 1;
-  cv.width = Math.round(cv.clientWidth * dpr);
-  cv.height = Math.round(cv.clientHeight * dpr);
-}
-
-function fitPlan() {
-  resizeCanvas();
-  const W = cv.clientWidth, H = cv.clientHeight, P = planPts();
-  if (!P.length) { view = { s: 100, ox: W / 2, oy: H / 2 }; drawPlan(); return; }
-  const xs = P.map(p => p.x), ys = P.map(p => p.y);
-  const minx = Math.min(...xs), maxx = Math.max(...xs), miny = Math.min(...ys), maxy = Math.max(...ys);
-  const w = Math.max(maxx - minx, 0.1), h = Math.max(maxy - miny, 0.1);
-  const s = Math.min((W - 110) / w, (H - 110) / h);
-  view = { s, ox: W / 2 - (minx + maxx) / 2 * s, oy: H / 2 - (miny + maxy) / 2 * s };
-  drawPlan();
-}
-
-function zoomAt(px, py, k) {
-  const ns = Math.min(Math.max(view.s * k, 5), 20000);
-  k = ns / view.s;
-  view.ox = px - (px - view.ox) * k;
-  view.oy = py - (py - view.oy) * k;
-  view.s = ns;
-}
-
-function label(text, x, y, color) {
-  cx.font = '13px system-ui, sans-serif';
-  const w = cx.measureText(text).width + 10;
-  cx.fillStyle = 'rgba(15,18,23,.85)';
-  cx.fillRect(x - w / 2, y - 10, w, 20);
-  cx.fillStyle = color || '#eef1f5';
-  cx.textAlign = 'center'; cx.textBaseline = 'middle';
-  cx.fillText(text, x, y);
-}
-
-function drawPlan() {
-  const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
-  cx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  cx.clearRect(0, 0, W, H);
-  const X = x => view.ox + x * view.s, Y = y => view.oy + y * view.s;
-
-  // сетка
-  const steps = [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 50];
-  const g = steps.find(s => s * view.s >= 40) || 50;
-  cx.strokeStyle = '#1e2430'; cx.lineWidth = 1; cx.beginPath();
-  for (let x = Math.floor(-view.ox / view.s / g) * g; X(x) <= W; x += g) { cx.moveTo(X(x), 0); cx.lineTo(X(x), H); }
-  for (let y = Math.floor(-view.oy / view.s / g) * g; Y(y) <= H; y += g) { cx.moveTo(0, Y(y)); cx.lineTo(W, Y(y)); }
-  cx.stroke();
-  cx.fillStyle = '#5d6877'; cx.font = '12px system-ui'; cx.textAlign = 'left'; cx.textBaseline = 'top';
-  cx.fillText('сетка ' + (g >= 1 ? g + ' м' : Math.round(g * 1000) + ' мм'), 8, 8);
-
-  const P = planPts();
-  if (!P.length) return;
-  if (P.length >= 2) {
-    cx.beginPath();
-    P.forEach((p, i) => i ? cx.lineTo(X(p.x), Y(p.y)) : cx.moveTo(X(p.x), Y(p.y)));
-    if (closed) { cx.closePath(); cx.fillStyle = 'rgba(45,127,249,.18)'; cx.fill(); }
-    cx.strokeStyle = '#2d7ff9'; cx.lineWidth = 2.5; cx.stroke();
-
-    // подписи сторон
-    const n = closed ? P.length : P.length - 1;
-    for (let i = 0; i < n; i++) {
-      const a = P[i], b = P[(i + 1) % P.length];
-      const d = mode === 'dist' ? Math.hypot(b.x - a.x, b.h - a.h, b.y - a.y) : Math.hypot(b.x - a.x, b.y - a.y);
-      let t = d.toFixed(3) + ' м';
-      if (mode === 'dist') t += '  Δh ' + Math.abs(b.h - a.h).toFixed(3);
-      label(t, X((a.x + b.x) / 2), Y((a.y + b.y) / 2), '#ffd27a');
-    }
-  }
-  P.forEach((p, i) => {
-    cx.beginPath(); cx.arc(X(p.x), Y(p.y), 6, 0, 7);
-    cx.fillStyle = '#19a974'; cx.fill();
-    cx.fillStyle = '#fff'; cx.font = 'bold 12px system-ui'; cx.textAlign = 'left'; cx.textBaseline = 'bottom';
-    cx.fillText(String(i + 1), X(p.x) + 8, Y(p.y) - 6);
-  });
-  if (closed && P.length >= 3) {
-    const cxm = P.reduce((s, p) => s + p.x, 0) / P.length, cym = P.reduce((s, p) => s + p.y, 0) / P.length;
-    label((polyArea(pts) * scaleK * scaleK).toFixed(2) + ' м²', X(cxm), Y(cym), '#8be3b8');
-  }
-}
-
-const ptrs = new Map();
-cv.addEventListener('pointerdown', e => { cv.setPointerCapture(e.pointerId); ptrs.set(e.pointerId, { x: e.offsetX, y: e.offsetY }); });
-cv.addEventListener('pointermove', e => {
-  if (!ptrs.has(e.pointerId)) return;
-  const prev = ptrs.get(e.pointerId), cur = { x: e.offsetX, y: e.offsetY };
-  if (ptrs.size === 1) {
-    view.ox += cur.x - prev.x; view.oy += cur.y - prev.y;
-  } else if (ptrs.size === 2) {
-    const other = [...ptrs.entries()].find(([id]) => id !== e.pointerId)[1];
-    const d0 = Math.hypot(prev.x - other.x, prev.y - other.y), d1 = Math.hypot(cur.x - other.x, cur.y - other.y);
-    const m0 = { x: (prev.x + other.x) / 2, y: (prev.y + other.y) / 2 }, m1 = { x: (cur.x + other.x) / 2, y: (cur.y + other.y) / 2 };
-    if (d0 > 0) zoomAt(m0.x, m0.y, d1 / d0);
-    view.ox += m1.x - m0.x; view.oy += m1.y - m0.y;
-  }
-  ptrs.set(e.pointerId, cur); drawPlan();
-});
-['pointerup', 'pointercancel'].forEach(ev => cv.addEventListener(ev, e => ptrs.delete(e.pointerId)));
-cv.addEventListener('wheel', e => { e.preventDefault(); zoomAt(e.offsetX, e.offsetY, e.deltaY < 0 ? 1.15 : 1 / 1.15); drawPlan(); }, { passive: false });
-$('zin').onclick = () => { zoomAt(cv.clientWidth / 2, cv.clientHeight / 2, 1.4); drawPlan(); };
-$('zout').onclick = () => { zoomAt(cv.clientWidth / 2, cv.clientHeight / 2, 1 / 1.4); drawPlan(); };
-$('zfit').onclick = fitPlan;
-
-// ---------- DXF (мм) ----------
-$('dxf').onclick = () => {
-  if (!pts.length) return;
-  const q = pts.map(p => [Math.round(p.x * scaleK * 1000), Math.round(-p.z * scaleK * 1000), Math.round(p.y * scaleK * 1000)]);
-  let s = '0\nSECTION\n2\nENTITIES\n';
-  if (mode === 'room' && q.length >= 2) {
-    s += '0\nPOLYLINE\n8\n0\n66\n1\n70\n' + (closed ? 1 : 0) + '\n';
-    q.forEach(v => { s += '0\nVERTEX\n8\n0\n10\n' + v[0] + '\n20\n' + v[1] + '\n30\n0\n'; });
-    s += '0\nSEQEND\n8\n0\n';
-  } else if (q.length >= 2) {
-    const a = q[q.length - 2], b = q[q.length - 1];
-    s += '0\nLINE\n8\n0\n10\n' + a[0] + '\n20\n' + a[1] + '\n30\n' + a[2] + '\n11\n' + b[0] + '\n21\n' + b[1] + '\n31\n' + b[2] + '\n';
-  }
-  s += '0\nENDSEC\n0\nEOF\n';
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([s], { type: 'application/dxf' }));
-  a.download = 'room.dxf';
-  a.click();
-};
 
 renderer.setAnimationLoop((t, frame) => {
   if (frame && session) {
@@ -344,61 +237,164 @@ renderer.setAnimationLoop((t, frame) => {
   renderer.render(scene, camera);
 });
 
-// ---------- расчёты ----------
-const m = v => v * scaleK;                       // метры с поправкой
+// ---------- геометрия ----------
+const m = v => v * scaleK;
 const fmt = v => { v = m(v); return v.toFixed(3) + ' м (' + Math.round(v * 1000) + ' мм)'; };
+const fmtMm = v => Math.round(m(v) * 1000) + ' мм';
 const flat = (a, b) => Math.hypot(a.x - b.x, a.z - b.z);
 
-function polyArea(p) {                           // шоелейс по XZ
+function areaXY(P) {                              // шоелейс по массиву {x,y}
   let s = 0;
-  for (let i = 0; i < p.length; i++) {
-    const a = p[i], b = p[(i + 1) % p.length];
-    s += a.x * b.z - b.x * a.z;
-  }
+  for (let i = 0; i < P.length; i++) { const a = P[i], b = P[(i + 1) % P.length]; s += a.x * b.y - b.x * a.y; }
   return Math.abs(s) / 2;
+}
+
+function contours() {
+  if (mode === 'part') return cont.filter(c => c.idx.length >= 2);
+  if (mode === 'room') return pts.length >= 2 ? [{ idx: pts.map((_, i) => i), closed }] : [];
+  return pts.length >= 2 ? [{ idx: [pts.length - 2, pts.length - 1], closed: false }] : [];
+}
+
+// собственные векторы симметричной 3x3 (метод Якоби)
+function eig3(A) {
+  const V = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  for (let it = 0; it < 60; it++) {
+    let p = 0, q = 1, mx = Math.abs(A[0][1]);
+    if (Math.abs(A[0][2]) > mx) { p = 0; q = 2; mx = Math.abs(A[0][2]); }
+    if (Math.abs(A[1][2]) > mx) { p = 1; q = 2; mx = Math.abs(A[1][2]); }
+    if (mx < 1e-14) break;
+    const th = (A[q][q] - A[p][p]) / (2 * A[p][q]);
+    const t = (th >= 0 ? 1 : -1) / (Math.abs(th) + Math.sqrt(th * th + 1));
+    const c = 1 / Math.sqrt(t * t + 1), s = t * c;
+    for (let k = 0; k < 3; k++) { const a = A[k][p], b = A[k][q]; A[k][p] = c * a - s * b; A[k][q] = s * a + c * b; }
+    for (let k = 0; k < 3; k++) { const a = A[p][k], b = A[q][k]; A[p][k] = c * a - s * b; A[q][k] = s * a + c * b; }
+    for (let k = 0; k < 3; k++) { const a = V[k][p], b = V[k][q]; V[k][p] = c * a - s * b; V[k][q] = s * a + c * b; }
+  }
+  return { vals: [A[0][0], A[1][1], A[2][2]], V };
+}
+
+// проекция точек на плоскость плана (в метрах с учётом коэффициента)
+function makeProj() {
+  const sk = scaleK;
+  let basis = null, dev = 0;
+  if (mode === 'part' && pts.length >= 3) {
+    const c = new THREE.Vector3(); pts.forEach(p => c.add(p)); c.divideScalar(pts.length);
+    const A = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    pts.forEach(p => { const d = [p.x - c.x, p.y - c.y, p.z - c.z]; for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) A[i][j] += d[i] * d[j]; });
+    const { vals, V } = eig3(A);
+    let k = 0; for (let i = 1; i < 3; i++) if (vals[i] < vals[k]) k = i;
+    const n = new THREE.Vector3(V[0][k], V[1][k], V[2][k]).normalize();
+    dev = Math.max(...pts.map(p => Math.abs(p.clone().sub(c).dot(n)))) * sk;
+    if (Math.abs(n.y) < 0.7) {                   // вертикальная/наклонная деталь: смотрим «на неё»
+      if (eyeN) { const eye = eyeSum.clone().divideScalar(eyeN); if (n.dot(eye.sub(c)) < 0) n.negate(); }
+      const ex = new THREE.Vector3().crossVectors(UP, n).normalize();
+      const up = new THREE.Vector3().crossVectors(n, ex);
+      basis = { c, ex, ey: up.negate() };
+    }
+  }
+  const f = basis
+    ? p => { const d = p.clone().sub(basis.c); return { x: d.dot(basis.ex) * sk, y: d.dot(basis.ey) * sk }; }
+    : p => ({ x: p.x * sk, y: p.z * sk });
+  return { f, dev, vertical: !!basis };
+}
+
+function heights() {                              // высоты по углам (сырые единицы) или null
+  const h = []; let sum = 0, c = 0;
+  for (let i = 0; i < pts.length; i++) {
+    if (cp[i]) { h[i] = Math.abs(cp[i].y - pts[i].y); sum += h[i]; c++; } else h[i] = null;
+  }
+  if (!c) return null;
+  const mean = sum / c;
+  return h.map(v => v == null ? mean : v);
 }
 
 function summary() {
   const lines = [];
-  const json = { scale: scaleK, mode, closed, points_mm: pts.map(p => [p.x, p.y, p.z].map(v => Math.round(m(v) * 1000))) };
-  if (pts.length >= 2) {
-    if (mode === 'dist') {
-      const a = pts[pts.length - 2], b = pts[pts.length - 1];
-      lines.push('Расстояние 3D: ' + fmt(a.distanceTo(b)));
-      lines.push('По горизонтали: ' + fmt(flat(a, b)));
-      lines.push('По вертикали: ' + fmt(Math.abs(a.y - b.y)));
-      json.distance_mm = Math.round(m(a.distanceTo(b)) * 1000);
-    } else {
-      const n = closed ? pts.length : pts.length - 1;
-      let per = 0;
-      for (let i = 0; i < n; i++) {
-        const a = pts[i], b = pts[(i + 1) % pts.length];
-        const d = flat(a, b); per += d;
-        lines.push('Стена ' + (i + 1) + ': ' + fmt(d));
+  const json = { scale: scaleK, mode, units: 'mm', points_mm: pts.map(p => [p.x, p.y, p.z].map(v => Math.round(m(v) * 1000))) };
+
+  if (mode === 'dist' && pts.length >= 2) {
+    const a = pts[pts.length - 2], b = pts[pts.length - 1];
+    lines.push('Расстояние 3D: ' + fmt(a.distanceTo(b)));
+    lines.push('По горизонтали: ' + fmt(flat(a, b)));
+    lines.push('По вертикали: ' + fmt(Math.abs(a.y - b.y)));
+    json.distance_mm = Math.round(m(a.distanceTo(b)) * 1000);
+  }
+
+  if (mode === 'room' && pts.length >= 2) {
+    const n = closed ? pts.length : pts.length - 1;
+    let per = 0;
+    for (let i = 0; i < n; i++) { const d = flat(pts[i], pts[(i + 1) % pts.length]); per += d; lines.push('Стена ' + (i + 1) + ': ' + fmt(d)); }
+    lines.push('Периметр: ' + fmt(per));
+    json.closed = closed; json.perimeter_mm = Math.round(m(per) * 1000);
+    let A = 0;
+    if (closed && pts.length >= 3) {
+      A = areaXY(pts.map(p => ({ x: p.x, y: p.z }))) * scaleK * scaleK;
+      lines.push('Площадь пола: ' + A.toFixed(2) + ' м²');
+      json.floor_area_m2 = +A.toFixed(3);
+      const hs = heights();
+      if (hs) {
+        const avg = hs.reduce((s, v) => s + v, 0) / hs.length;
+        lines.push('Высота: средняя ' + fmt(avg) + ', мин ' + fmt(Math.min(...hs)) + ', макс ' + fmt(Math.max(...hs)));
+        hs.forEach((h, i) => { if (!cp[i]) return; lines.push('  угол ' + (i + 1) + ': ' + fmtMm(h)); });
+        const vol = A * m(avg);
+        let walls = 0;
+        for (let i = 0; i < pts.length; i++) { const j = (i + 1) % pts.length; walls += m(flat(pts[i], pts[j])) * m((hs[i] + hs[j]) / 2); }
+        lines.push('Объём: ' + vol.toFixed(2) + ' м³');
+        lines.push('Площадь стен: ' + walls.toFixed(2) + ' м²');
+        lines.push('Площадь потолка: ' + A.toFixed(2) + ' м² (плоский)');
+        json.heights_mm = hs.map(h => Math.round(m(h) * 1000));
+        json.volume_m3 = +vol.toFixed(3); json.walls_area_m2 = +walls.toFixed(3);
       }
-      lines.push('Периметр: ' + fmt(per));
-      const ys = pts.map(p => p.y);
-      lines.push('Разброс высот точек: ' + fmt(Math.max(...ys) - Math.min(...ys)));
-      if (closed && pts.length >= 3) {
-        const A = polyArea(pts) * scaleK * scaleK;
-        lines.push('Площадь: ' + A.toFixed(2) + ' м²');
-        json.area_m2 = +A.toFixed(3);
-      }
-      json.perimeter_mm = Math.round(m(per) * 1000);
     }
+  }
+
+  if (mode === 'part' && pts.length >= 2) {
+    const pr = makeProj(), P = pts.map(pr.f);
+    const xs = P.map(p => p.x), ys = P.map(p => p.y);
+    lines.push('Габарит: ' + Math.round((Math.max(...xs) - Math.min(...xs)) * 1000) + ' × ' + Math.round((Math.max(...ys) - Math.min(...ys)) * 1000) + ' мм');
+    lines.push('Отклонение от плоскости: ' + (pr.dev * 1000).toFixed(1) + ' мм');
+    json.contours = [];
+    contours().forEach((c, ci2) => {
+      const n = c.closed ? c.idx.length : c.idx.length - 1;
+      let per = 0; const segs = [];
+      for (let k = 0; k < n; k++) {
+        const a = c.idx[k], b = c.idx[(k + 1) % c.idx.length];
+        const d = pts[a].distanceTo(pts[b]); per += d;
+        segs.push((a + 1) + '→' + (b + 1) + ': ' + fmtMm(d));
+      }
+      let t = 'Контур ' + (ci2 + 1) + (c.closed ? ' (замкнут)' : '') + ': периметр ' + fmtMm(per);
+      let area = null;
+      if (c.closed && c.idx.length >= 3) { area = areaXY(c.idx.map(i => P[i])) * 1e4; t += ', площадь ' + area.toFixed(1) + ' см²'; }
+      lines.push(t); lines.push('  ' + segs.join('; '));
+      json.contours.push({ points: c.idx.map(i => i + 1), closed: c.closed, perimeter_mm: Math.round(m(per) * 1000), area_cm2: area == null ? null : +area.toFixed(1) });
+    });
+    json.points2d_mm = P.map(p => [Math.round(p.x * 1000), Math.round(-p.y * 1000)]);
   }
   return { text: lines.join('\n'), json };
 }
 
+// ---------- «живая» подсказка ----------
 function updateLive() {
-  if (!pts.length || (mode === 'dist' && pts.length >= 2) || closed) { liveLine.visible = false; $('live').textContent = pts.length ? 'Готово' : 'Ставь первую точку'; return; }
-  const last = pts[pts.length - 1];
+  let base = null, txt = '';
+  if (mode === 'room' && phase === 'ceil') {
+    if (ci < pts.length) { base = pts[ci]; txt = 'Потолок над углом ' + (ci + 1) + ': h = ' + fmt(Math.abs(hitPos.y - base.y)); }
+    else { liveLine.visible = false; $('live').textContent = 'Все углы пройдены'; return; }
+  } else if (mode === 'part') {
+    const c = cont[cont.length - 1];
+    if (c && !c.closed && c.idx.length) { base = pts[c.idx[c.idx.length - 1]]; txt = fmtMm(base.distanceTo(hitPos)); }
+    else { liveLine.visible = false; $('live').textContent = pts.length ? 'Ставь точку (новый контур)' : 'Ставь первую точку'; return; }
+  } else {
+    if (!pts.length || (mode === 'dist' && pts.length >= 2) || closed) {
+      liveLine.visible = false; $('live').textContent = pts.length ? 'Готово' : 'Ставь первую точку'; return;
+    }
+    base = pts[pts.length - 1]; txt = fmt(base.distanceTo(hitPos));
+  }
   const pa = liveGeom.attributes.position;
-  pa.setXYZ(0, last.x, last.y, last.z);
+  pa.setXYZ(0, base.x, base.y, base.z);
   pa.setXYZ(1, hitPos.x, hitPos.y, hitPos.z);
   pa.needsUpdate = true;
   liveLine.visible = true;
-  $('live').textContent = fmt(last.distanceTo(hitPos));
+  $('live').textContent = txt;
 }
 
 function redraw() {
@@ -410,34 +406,78 @@ function redraw() {
     if (i === sel) s.scale.setScalar(1.4);
     group.add(s);
   });
-  if (pts.length >= 2) {
-    const arr = pts.slice();
-    if (closed) arr.push(pts[0]);
+  contours().forEach(c => {
+    const arr = c.idx.map(i => pts[i]);
+    if (c.closed && arr.length > 2) arr.push(pts[c.idx[0]]);
     group.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(arr), lineMat));
-  }
+  });
+  if (mode === 'room') cp.forEach((p, i) => {
+    if (!p) return;
+    const s = new THREE.Mesh(sphereGeom, ceilMat); s.position.copy(p); group.add(s);
+    group.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([pts[i], p]), ceilLineMat));
+  });
   $('info').textContent = summary().text;
   update();
 }
 
+function show(id, on) { $(id).style.display = on ? '' : 'none'; }
 function update() {
-  $('mDist').classList.toggle('active', mode === 'dist');
-  $('mRoom').classList.toggle('active', mode === 'room');
-  $('close').style.display = mode === 'room' ? '' : 'none';
+  ['mDist', 'mRoom', 'mPart'].forEach(k => $(k).classList.toggle('active', k === { dist: 'mDist', room: 'mRoom', part: 'mPart' }[mode]));
+  show('close', (mode === 'room' && phase === 'floor') || mode === 'part');
+  show('newc', mode === 'part');
+  show('ceilBtn', mode === 'room' && closed);
+  show('skip', mode === 'room' && phase === 'ceil');
+  $('ceilBtn').textContent = phase === 'ceil' ? 'К полу' : 'Потолок';
   if (!pts.length) $('live').textContent = 'Ставь первую точку';
+  else if (mode === 'room' && phase === 'ceil') $('live').textContent = ci < pts.length ? 'Потолок: угол ' + (ci + 1) : 'Все углы пройдены';
 }
 
 // ---------- кнопки ----------
 $('go').onclick = start;
 $('put').onclick = () => {
   if (!reticle.visible) return;
-  if (closed) return;
-  if (mode === 'dist' && pts.length >= 2) pts = [];
-  pts.push(hitPos.clone());
+  const e = new THREE.Vector3(); renderer.xr.getCamera().getWorldPosition(e); eyeSum.add(e); eyeN++;
+  if (mode === 'room' && phase === 'ceil') {
+    if (ci < pts.length) { cp[ci] = hitPos.clone(); sel = ci; ci++; redraw(); }
+    return;
+  }
+  if (mode === 'dist') { if (pts.length >= 2) pts = []; pts.push(hitPos.clone()); }
+  else if (mode === 'room') { if (closed) return; pts.push(hitPos.clone()); }
+  else {
+    let c = cont[cont.length - 1];
+    if (c.closed) { c = { idx: [], closed: false }; cont.push(c); }
+    pts.push(hitPos.clone()); c.idx.push(pts.length - 1);
+  }
   sel = pts.length - 1;
   redraw();
 };
-$('undo').onclick = () => { closed = false; pts.pop(); sel = pts.length - 1; redraw(); };
-$('reset').onclick = () => { pts = []; closed = false; sel = -1; redraw(); };
+$('undo').onclick = () => {
+  if (mode === 'room' && phase === 'ceil') { if (ci > 0) { ci--; cp[ci] = null; sel = ci - 1; } }
+  else if (mode === 'room') { if (closed) closed = false; else pts.pop(); }
+  else if (mode === 'part') {
+    while (cont.length > 1 && !cont[cont.length - 1].idx.length) cont.pop();
+    const c = cont[cont.length - 1];
+    if (c.closed) c.closed = false; else if (c.idx.length) { c.idx.pop(); pts.pop(); }
+  } else pts.pop();
+  sel = pts.length - 1; redraw();
+};
+$('reset').onclick = () => { resetAll(); redraw(); };
+$('close').onclick = () => {
+  if (mode === 'room') { if (pts.length >= 3) { closed = true; redraw(); } }
+  else if (mode === 'part') { const c = cont[cont.length - 1]; if (c.idx.length >= 3) { c.closed = true; redraw(); } }
+};
+$('newc').onclick = () => { if (cont[cont.length - 1].idx.length) { cont.push({ idx: [], closed: false }); redraw(); } };
+$('ceilBtn').onclick = () => {
+  if (phase === 'floor') { phase = 'ceil'; ci = cp.findIndex(v => !v); if (ci < 0) ci = pts.length; } else phase = 'floor';
+  redraw();
+};
+$('skip').onclick = () => { if (ci < pts.length) { ci++; redraw(); } };
+const setMode = k => () => { mode = k; resetAll(); redraw(); };
+$('mDist').onclick = setMode('dist');
+$('mRoom').onclick = setMode('room');
+$('mPart').onclick = setMode('part');
+$('exit').onclick = () => session && session.end();
+$('again').onclick = start;
 
 // ---------- подстройка выбранной точки ----------
 $('nudge').onclick = () => {
@@ -453,9 +493,13 @@ $('step').onclick = () => {
 $('prevPt').onclick = () => { if (pts.length) { sel = (sel - 1 + pts.length) % pts.length; redraw(); } };
 $('nextPt').onclick = () => { if (pts.length) { sel = (sel + 1) % pts.length; redraw(); } };
 
-const UP = new THREE.Vector3(0, 1, 0);
 function nudge(dir) {
   if (sel < 0 || sel >= pts.length) return;
+  const st = stepMm / 1000 / scaleK;
+  if (mode === 'room' && phase === 'ceil') {     // на потолке двигаем только по высоте
+    if (cp[sel] && (dir === 'up' || dir === 'down')) { cp[sel].y += dir === 'up' ? st : -st; redraw(); }
+    return;
+  }
   const f = new THREE.Vector3();
   renderer.xr.getCamera().getWorldDirection(f);
   f.y = 0;
@@ -463,7 +507,7 @@ function nudge(dir) {
   f.normalize();
   const r = new THREE.Vector3().crossVectors(f, UP);        // вправо относительно взгляда
   const v = { left: r.clone().negate(), right: r, fwd: f, back: f.clone().negate(), up: UP, down: UP.clone().negate() }[dir];
-  pts[sel].addScaledVector(v, stepMm / 1000 / scaleK);
+  pts[sel].addScaledVector(v, st);
   redraw();
 }
 document.querySelectorAll('#pad [data-d]').forEach(b => {
@@ -476,11 +520,233 @@ document.querySelectorAll('#pad [data-d]').forEach(b => {
   });
   ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => b.addEventListener(ev, stop));
 });
-$('close').onclick = () => { if (pts.length >= 3) { closed = true; redraw(); } };
-$('mDist').onclick = () => { mode = 'dist'; pts = []; closed = false; redraw(); };
-$('mRoom').onclick = () => { mode = 'room'; pts = []; closed = false; redraw(); };
-$('exit').onclick = () => session && session.end();
-$('again').onclick = start;
+
+// ---------- план с зумом ----------
+const cv = $('plan'), cx = cv.getContext('2d');
+let view = { s: 100, ox: 0, oy: 0 };
+
+function resizeCanvas() {
+  const dpr = devicePixelRatio || 1;
+  cv.width = Math.round(cv.clientWidth * dpr);
+  cv.height = Math.round(cv.clientHeight * dpr);
+}
+
+function fitPlan() {
+  resizeCanvas();
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (!pts.length) { view = { s: 100, ox: W / 2, oy: H / 2 }; drawPlan(); return; }
+  const P = pts.map(makeProj().f);
+  const xs = P.map(p => p.x), ys = P.map(p => p.y);
+  const minx = Math.min(...xs), maxx = Math.max(...xs), miny = Math.min(...ys), maxy = Math.max(...ys);
+  const w = Math.max(maxx - minx, 0.02), h = Math.max(maxy - miny, 0.02);
+  const s = Math.min((W - 110) / w, (H - 110) / h);
+  view = { s, ox: W / 2 - (minx + maxx) / 2 * s, oy: H / 2 - (miny + maxy) / 2 * s };
+  drawPlan();
+}
+
+function zoomAt(px, py, k) {
+  const ns = Math.min(Math.max(view.s * k, 5), 200000);
+  k = ns / view.s;
+  view.ox = px - (px - view.ox) * k;
+  view.oy = py - (py - view.oy) * k;
+  view.s = ns;
+}
+
+function label(text, x, y, color) {
+  cx.font = '13px system-ui, sans-serif';
+  const w = cx.measureText(text).width + 10;
+  cx.fillStyle = 'rgba(15,18,23,.85)';
+  cx.fillRect(x - w / 2, y - 10, w, 20);
+  cx.fillStyle = color || '#eef1f5';
+  cx.textAlign = 'center'; cx.textBaseline = 'middle';
+  cx.fillText(text, x, y);
+}
+
+function drawPlan() {
+  const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  cx.clearRect(0, 0, W, H);
+  const X = x => view.ox + x * view.s, Y = y => view.oy + y * view.s;
+
+  const steps = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 50];
+  const g = steps.find(s => s * view.s >= 40) || 50;
+  cx.strokeStyle = '#1e2430'; cx.lineWidth = 1; cx.beginPath();
+  for (let x = Math.floor(-view.ox / view.s / g) * g; X(x) <= W; x += g) { cx.moveTo(X(x), 0); cx.lineTo(X(x), H); }
+  for (let y = Math.floor(-view.oy / view.s / g) * g; Y(y) <= H; y += g) { cx.moveTo(0, Y(y)); cx.lineTo(W, Y(y)); }
+  cx.stroke();
+  cx.fillStyle = '#5d6877'; cx.font = '12px system-ui'; cx.textAlign = 'left'; cx.textBaseline = 'top';
+  cx.fillText('сетка ' + (g >= 1 ? g + ' м' : Math.round(g * 1000) + ' мм'), 8, 8);
+  if (!pts.length) return;
+
+  const pr = makeProj(), P = pts.map(p => ({ ...pr.f(p), h: p.y * scaleK }));
+  const cs = contours();
+
+  // заливка замкнутых контуров (отверстия — по even-odd)
+  cx.beginPath();
+  cs.forEach(c => {
+    if (!c.closed || c.idx.length < 3) return;
+    c.idx.forEach((i, k) => k ? cx.lineTo(X(P[i].x), Y(P[i].y)) : cx.moveTo(X(P[i].x), Y(P[i].y)));
+    cx.closePath();
+  });
+  cx.fillStyle = 'rgba(45,127,249,.18)'; cx.fill('evenodd');
+
+  cs.forEach(c => {
+    cx.beginPath();
+    c.idx.forEach((i, k) => k ? cx.lineTo(X(P[i].x), Y(P[i].y)) : cx.moveTo(X(P[i].x), Y(P[i].y)));
+    if (c.closed) cx.closePath();
+    cx.strokeStyle = '#2d7ff9'; cx.lineWidth = 2.5; cx.stroke();
+  });
+  cs.forEach(c => {
+    const n = c.closed ? c.idx.length : c.idx.length - 1;
+    for (let k = 0; k < n; k++) {
+      const ia = c.idx[k], ib = c.idx[(k + 1) % c.idx.length], a = P[ia], b = P[ib];
+      let t;
+      if (mode === 'part') t = Math.round(pts[ia].distanceTo(pts[ib]) * scaleK * 1000) + ' мм';
+      else if (mode === 'dist') t = (pts[ia].distanceTo(pts[ib]) * scaleK).toFixed(3) + ' м  Δh ' + Math.abs(a.h - b.h).toFixed(3);
+      else t = Math.hypot(b.x - a.x, b.y - a.y).toFixed(3) + ' м';
+      label(t, X((a.x + b.x) / 2), Y((a.y + b.y) / 2), '#ffd27a');
+    }
+    if (c.closed && c.idx.length >= 3) {
+      const q = c.idx.map(i => P[i]);
+      const ax = q.reduce((s, p) => s + p.x, 0) / q.length, ay = q.reduce((s, p) => s + p.y, 0) / q.length;
+      const A = areaXY(q);
+      label(mode === 'part' ? (A * 1e4).toFixed(1) + ' см²' : A.toFixed(2) + ' м²', X(ax), Y(ay), '#8be3b8');
+    }
+  });
+  const hs = mode === 'room' ? heights() : null;
+  P.forEach((p, i) => {
+    cx.beginPath(); cx.arc(X(p.x), Y(p.y), 6, 0, 7);
+    cx.fillStyle = '#19a974'; cx.fill();
+    cx.fillStyle = '#fff'; cx.font = 'bold 12px system-ui'; cx.textAlign = 'left'; cx.textBaseline = 'bottom';
+    cx.fillText(String(i + 1) + (hs && cp[i] ? '  h ' + Math.round(m(hs[i]) * 1000) : ''), X(p.x) + 8, Y(p.y) - 6);
+  });
+}
+
+const ptrs = new Map();
+cv.addEventListener('pointerdown', e => { cv.setPointerCapture(e.pointerId); ptrs.set(e.pointerId, { x: e.offsetX, y: e.offsetY }); });
+cv.addEventListener('pointermove', e => {
+  if (!ptrs.has(e.pointerId)) return;
+  const prev = ptrs.get(e.pointerId), cur = { x: e.offsetX, y: e.offsetY };
+  if (ptrs.size === 1) {
+    view.ox += cur.x - prev.x; view.oy += cur.y - prev.y;
+  } else if (ptrs.size === 2) {
+    const other = [...ptrs.entries()].find(([id]) => id !== e.pointerId)[1];
+    const d0 = Math.hypot(prev.x - other.x, prev.y - other.y), d1 = Math.hypot(cur.x - other.x, cur.y - other.y);
+    const m0 = { x: (prev.x + other.x) / 2, y: (prev.y + other.y) / 2 }, m1 = { x: (cur.x + other.x) / 2, y: (cur.y + other.y) / 2 };
+    if (d0 > 0) zoomAt(m0.x, m0.y, d1 / d0);
+    view.ox += m1.x - m0.x; view.oy += m1.y - m0.y;
+  }
+  ptrs.set(e.pointerId, cur); drawPlan();
+});
+['pointerup', 'pointercancel'].forEach(ev => cv.addEventListener(ev, e => ptrs.delete(e.pointerId)));
+cv.addEventListener('wheel', e => { e.preventDefault(); zoomAt(e.offsetX, e.offsetY, e.deltaY < 0 ? 1.15 : 1 / 1.15); drawPlan(); }, { passive: false });
+$('zin').onclick = () => { zoomAt(cv.clientWidth / 2, cv.clientHeight / 2, 1.4); drawPlan(); };
+$('zout').onclick = () => { zoomAt(cv.clientWidth / 2, cv.clientHeight / 2, 1 / 1.4); drawPlan(); };
+$('zfit').onclick = fitPlan;
+
+// ---------- экспорт ----------
+function earclip(P) {                            // P: [[x,y],...] -> [[i,j,k],...]
+  const n = P.length; if (n < 3) return [];
+  let idx = [...Array(n).keys()];
+  const area = P.reduce((s, p, i) => { const q = P[(i + 1) % n]; return s + p[0] * q[1] - q[0] * p[1]; }, 0);
+  if (area < 0) idx.reverse();
+  const cross = (a, b, c) => (P[b][0] - P[a][0]) * (P[c][1] - P[a][1]) - (P[b][1] - P[a][1]) * (P[c][0] - P[a][0]);
+  const inTri = (p, a, b, c) => cross(a, b, p) >= 0 && cross(b, c, p) >= 0 && cross(c, a, p) >= 0;
+  const out = []; let guard = 0;
+  while (idx.length > 3 && guard++ < 2000) {
+    let clipped = false;
+    for (let i = 0; i < idx.length; i++) {
+      const a = idx[(i + idx.length - 1) % idx.length], b = idx[i], c = idx[(i + 1) % idx.length];
+      if (cross(a, b, c) <= 1e-12) continue;
+      let ok = true;
+      for (const p of idx) if (p !== a && p !== b && p !== c && inTri(p, a, b, c)) { ok = false; break; }
+      if (ok) { out.push([a, b, c]); idx.splice(i, 1); clipped = true; break; }
+    }
+    if (!clipped) break;
+  }
+  if (idx.length === 3) out.push([idx[0], idx[1], idx[2]]);
+  return out;
+}
+
+function geom() {                                // мм, Y вверх, сдвинуто в начало координат
+  const K = 1000 * scaleK, V = p => [p.x * K, p.y * K, p.z * K];
+  const tris = [], lines = [];
+  if (mode === 'room' && closed && pts.length >= 3) {
+    const n = pts.length, hs = heights();
+    const F = pts.map(V);
+    const T = hs ? pts.map((p, i) => [p.x * K, (p.y + hs[i]) * K, p.z * K]) : null;
+    earclip(pts.map(p => [p.x, p.z])).forEach(t => {
+      tris.push([F[t[0]], F[t[1]], F[t[2]]]);
+      if (T) tris.push([T[t[0]], T[t[1]], T[t[2]]]);
+    });
+    for (let i = 0; i < n; i++) {
+      const j = (i + 1) % n;
+      lines.push([F[i], F[j]]);
+      if (T) { lines.push([T[i], T[j]], [F[i], T[i]]); tris.push([F[i], F[j], T[j]], [F[i], T[j], T[i]]); }
+    }
+  } else {
+    contours().forEach(c => {
+      for (let k = 0; k + 1 < c.idx.length; k++) lines.push([V(pts[c.idx[k]]), V(pts[c.idx[k + 1]])]);
+      if (c.closed && c.idx.length > 2) lines.push([V(pts[c.idx[c.idx.length - 1]]), V(pts[c.idx[0]])]);
+    });
+  }
+  const all = [...tris.flat(), ...lines.flat()];
+  if (!all.length) return null;
+  const mn = [0, 1, 2].map(a => Math.min(...all.map(v => v[a])));
+  const sh = v => [v[0] - mn[0], v[1] - mn[1], v[2] - mn[2]];
+  return { tris: tris.map(t => t.map(sh)), lines: lines.map(l => l.map(sh)) };
+}
+
+function toOBJ(g) {
+  const verts = [], map = new Map();
+  const id = v => { const k = v.map(x => x.toFixed(2)).join(','); if (!map.has(k)) { map.set(k, verts.length + 1); verts.push(v); } return map.get(k); };
+  const faces = g.tris.map(t => t.map(id)), ls = g.lines.map(l => l.map(id));
+  let s = '# AR ruler. units: mm, Y up\n';
+  verts.forEach(v => s += 'v ' + v.map(x => x.toFixed(2)).join(' ') + '\n');
+  faces.forEach(f => s += 'f ' + f.join(' ') + '\n');
+  ls.forEach(l => s += 'l ' + l.join(' ') + '\n');
+  return s;
+}
+
+function toDXF3D(g) {                            // Z вверх: (x, -z, y)
+  const D = v => [v[0], -v[2], v[1]], f = x => x.toFixed(2);
+  let s = '0\nSECTION\n2\nENTITIES\n';
+  g.lines.forEach(l => {
+    const a = D(l[0]), b = D(l[1]);
+    s += '0\nLINE\n8\n0\n10\n' + f(a[0]) + '\n20\n' + f(a[1]) + '\n30\n' + f(a[2]) + '\n11\n' + f(b[0]) + '\n21\n' + f(b[1]) + '\n31\n' + f(b[2]) + '\n';
+  });
+  g.tris.forEach(t => {
+    const p = t.map(D);
+    s += '0\n3DFACE\n8\n0\n';
+    [0, 1, 2, 2].forEach((i, k) => { s += (10 + k) + '\n' + f(p[i][0]) + '\n' + (20 + k) + '\n' + f(p[i][1]) + '\n' + (30 + k) + '\n' + f(p[i][2]) + '\n'; });
+  });
+  return s + '0\nENDSEC\n0\nEOF\n';
+}
+
+function toDXF2D() {                             // плоский контур по плану, мм
+  const pr = makeProj(), P = pts.map(pr.f).map(p => ({ x: p.x * 1000, y: -p.y * 1000 }));
+  if (!P.length) return null;
+  const mx = Math.min(...P.map(p => p.x)), my = Math.min(...P.map(p => p.y));
+  let s = '0\nSECTION\n2\nENTITIES\n';
+  contours().forEach(c => {
+    s += '0\nPOLYLINE\n8\n0\n66\n1\n70\n' + (c.closed ? 1 : 0) + '\n';
+    c.idx.forEach(i => { s += '0\nVERTEX\n8\n0\n10\n' + (P[i].x - mx).toFixed(2) + '\n20\n' + (P[i].y - my).toFixed(2) + '\n30\n0\n'; });
+    s += '0\nSEQEND\n8\n0\n';
+  });
+  return s + '0\nENDSEC\n0\nEOF\n';
+}
+
+function save(name, text) {
+  if (!text) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+  a.download = name;
+  a.click();
+}
+const base = () => ({ dist: 'length', room: 'room', part: 'part' }[mode]);
+$('dxf2').onclick = () => save(base() + '_2d.dxf', toDXF2D());
+$('dxf3').onclick = () => { const g = geom(); if (g) save(base() + '_3d.dxf', toDXF3D(g)); };
+$('obj').onclick = () => { const g = geom(); if (g) save(base() + '.obj', toOBJ(g)); };
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
