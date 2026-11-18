@@ -24,7 +24,11 @@
   #bottom { padding: 10px; display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; background: rgba(10,12,16,.72); }
   #bottom button { flex: 1 1 28%; }
   #put { flex: 1 1 100% !important; padding: 18px; font-size: 20px; background: #f59e0b; color: #111; }
-  #result { display: none; padding: 16px; overflow: auto; }
+  #result { display: none; padding: 12px; overflow: auto; flex: 1; min-height: 0; }
+  #plan { width: 100%; height: 52vh; display: block; border-radius: 12px; background: #0f1217; touch-action: none; }
+  .padgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; padding: 8px; background: rgba(10,12,16,.72); }
+  .padgrid button { padding: 12px 4px; background: #3a4352; touch-action: manipulation; user-select: none; }
+  .padgrid button.sec { background: #2b313b; font-size: 14px; }
   textarea { width: 100%; height: 160px; background: #0c0e12; color: #cfe; border: 1px solid #333; border-radius: 8px; font: 12px monospace; }
   label { font-size: 14px; color: #a9b2bf; }
   input[type=number] { width: 110px; padding: 8px; border-radius: 8px; border: 1px solid #333; background: #0c0e12; color: #fff; font: inherit; }
@@ -52,8 +56,14 @@
   </div>
 
   <div id="hud2" style="display:none">
+    <div id="pad" class="padgrid" style="display:none">
+      <button data-d="up">⤒ вверх</button><button data-d="fwd">▲ вперёд</button><button data-d="down">⤓ вниз</button>
+      <button data-d="left">◀</button><button id="step" class="sec">шаг 10 мм</button><button data-d="right">▶</button>
+      <button id="prevPt" class="sec">‹ точка</button><button data-d="back">▼ назад</button><button id="nextPt" class="sec">точка ›</button>
+    </div>
     <div id="bottom">
       <button id="put">＋ Поставить точку</button>
+      <button class="sec" id="nudge">Подстройка</button>
       <button class="sec active" id="mDist">Длина</button>
       <button class="sec" id="mRoom">Комната</button>
       <button class="sec" id="undo">Отмена</button>
@@ -64,7 +74,14 @@
   </div>
 
   <div id="result">
-    <h2 style="margin-top:0">Результат</h2>
+    <h2 style="margin:0 0 8px">План (вид сверху)</h2>
+    <canvas id="plan"></canvas>
+    <div class="row">
+      <button class="sec" id="zin">＋</button>
+      <button class="sec" id="zout">－</button>
+      <button class="sec" id="zfit">По размеру</button>
+      <button class="sec" id="dxf">Скачать DXF</button>
+    </div>
     <div id="resText" style="white-space:pre-line"></div>
     <p><label>JSON (точки в мм)</label></p>
     <textarea id="json" readonly></textarea>
@@ -123,7 +140,10 @@ scene.add(liveLine);
 
 const sphereGeom = new THREE.SphereGeometry(0.012, 16, 12);
 const sphereMat = new THREE.MeshBasicMaterial({ color: 0x19a974 });
+const selMat = new THREE.MeshBasicMaterial({ color: 0xf59e0b });
 const lineMat = new THREE.LineBasicMaterial({ color: 0x2d7ff9 });
+let sel = -1;           // индекс выбранной точки для подстройки
+let stepMm = 10;
 
 // ---------- WebXR ----------
 let session = null, hitSource = null, hitRequested = false;
@@ -165,7 +185,138 @@ function onEnd() {
   $('resText').textContent = s.text || 'Точек нет.';
   $('json').value = JSON.stringify(s.json, null, 1);
   $('result').style.display = 'block';
+  fitPlan();
 }
+
+// ---------- план сверху с зумом ----------
+const cv = $('plan'), cx = cv.getContext('2d');
+let view = { s: 100, ox: 0, oy: 0 };       // px на метр, смещение в px
+
+function planPts() { return pts.map(p => ({ x: p.x * scaleK, y: p.z * scaleK, h: p.y * scaleK })); }
+
+function resizeCanvas() {
+  const dpr = devicePixelRatio || 1;
+  cv.width = Math.round(cv.clientWidth * dpr);
+  cv.height = Math.round(cv.clientHeight * dpr);
+}
+
+function fitPlan() {
+  resizeCanvas();
+  const W = cv.clientWidth, H = cv.clientHeight, P = planPts();
+  if (!P.length) { view = { s: 100, ox: W / 2, oy: H / 2 }; drawPlan(); return; }
+  const xs = P.map(p => p.x), ys = P.map(p => p.y);
+  const minx = Math.min(...xs), maxx = Math.max(...xs), miny = Math.min(...ys), maxy = Math.max(...ys);
+  const w = Math.max(maxx - minx, 0.1), h = Math.max(maxy - miny, 0.1);
+  const s = Math.min((W - 110) / w, (H - 110) / h);
+  view = { s, ox: W / 2 - (minx + maxx) / 2 * s, oy: H / 2 - (miny + maxy) / 2 * s };
+  drawPlan();
+}
+
+function zoomAt(px, py, k) {
+  const ns = Math.min(Math.max(view.s * k, 5), 20000);
+  k = ns / view.s;
+  view.ox = px - (px - view.ox) * k;
+  view.oy = py - (py - view.oy) * k;
+  view.s = ns;
+}
+
+function label(text, x, y, color) {
+  cx.font = '13px system-ui, sans-serif';
+  const w = cx.measureText(text).width + 10;
+  cx.fillStyle = 'rgba(15,18,23,.85)';
+  cx.fillRect(x - w / 2, y - 10, w, 20);
+  cx.fillStyle = color || '#eef1f5';
+  cx.textAlign = 'center'; cx.textBaseline = 'middle';
+  cx.fillText(text, x, y);
+}
+
+function drawPlan() {
+  const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  cx.clearRect(0, 0, W, H);
+  const X = x => view.ox + x * view.s, Y = y => view.oy + y * view.s;
+
+  // сетка
+  const steps = [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 50];
+  const g = steps.find(s => s * view.s >= 40) || 50;
+  cx.strokeStyle = '#1e2430'; cx.lineWidth = 1; cx.beginPath();
+  for (let x = Math.floor(-view.ox / view.s / g) * g; X(x) <= W; x += g) { cx.moveTo(X(x), 0); cx.lineTo(X(x), H); }
+  for (let y = Math.floor(-view.oy / view.s / g) * g; Y(y) <= H; y += g) { cx.moveTo(0, Y(y)); cx.lineTo(W, Y(y)); }
+  cx.stroke();
+  cx.fillStyle = '#5d6877'; cx.font = '12px system-ui'; cx.textAlign = 'left'; cx.textBaseline = 'top';
+  cx.fillText('сетка ' + (g >= 1 ? g + ' м' : Math.round(g * 1000) + ' мм'), 8, 8);
+
+  const P = planPts();
+  if (!P.length) return;
+  if (P.length >= 2) {
+    cx.beginPath();
+    P.forEach((p, i) => i ? cx.lineTo(X(p.x), Y(p.y)) : cx.moveTo(X(p.x), Y(p.y)));
+    if (closed) { cx.closePath(); cx.fillStyle = 'rgba(45,127,249,.18)'; cx.fill(); }
+    cx.strokeStyle = '#2d7ff9'; cx.lineWidth = 2.5; cx.stroke();
+
+    // подписи сторон
+    const n = closed ? P.length : P.length - 1;
+    for (let i = 0; i < n; i++) {
+      const a = P[i], b = P[(i + 1) % P.length];
+      const d = mode === 'dist' ? Math.hypot(b.x - a.x, b.h - a.h, b.y - a.y) : Math.hypot(b.x - a.x, b.y - a.y);
+      let t = d.toFixed(3) + ' м';
+      if (mode === 'dist') t += '  Δh ' + Math.abs(b.h - a.h).toFixed(3);
+      label(t, X((a.x + b.x) / 2), Y((a.y + b.y) / 2), '#ffd27a');
+    }
+  }
+  P.forEach((p, i) => {
+    cx.beginPath(); cx.arc(X(p.x), Y(p.y), 6, 0, 7);
+    cx.fillStyle = '#19a974'; cx.fill();
+    cx.fillStyle = '#fff'; cx.font = 'bold 12px system-ui'; cx.textAlign = 'left'; cx.textBaseline = 'bottom';
+    cx.fillText(String(i + 1), X(p.x) + 8, Y(p.y) - 6);
+  });
+  if (closed && P.length >= 3) {
+    const cxm = P.reduce((s, p) => s + p.x, 0) / P.length, cym = P.reduce((s, p) => s + p.y, 0) / P.length;
+    label((polyArea(pts) * scaleK * scaleK).toFixed(2) + ' м²', X(cxm), Y(cym), '#8be3b8');
+  }
+}
+
+const ptrs = new Map();
+cv.addEventListener('pointerdown', e => { cv.setPointerCapture(e.pointerId); ptrs.set(e.pointerId, { x: e.offsetX, y: e.offsetY }); });
+cv.addEventListener('pointermove', e => {
+  if (!ptrs.has(e.pointerId)) return;
+  const prev = ptrs.get(e.pointerId), cur = { x: e.offsetX, y: e.offsetY };
+  if (ptrs.size === 1) {
+    view.ox += cur.x - prev.x; view.oy += cur.y - prev.y;
+  } else if (ptrs.size === 2) {
+    const other = [...ptrs.entries()].find(([id]) => id !== e.pointerId)[1];
+    const d0 = Math.hypot(prev.x - other.x, prev.y - other.y), d1 = Math.hypot(cur.x - other.x, cur.y - other.y);
+    const m0 = { x: (prev.x + other.x) / 2, y: (prev.y + other.y) / 2 }, m1 = { x: (cur.x + other.x) / 2, y: (cur.y + other.y) / 2 };
+    if (d0 > 0) zoomAt(m0.x, m0.y, d1 / d0);
+    view.ox += m1.x - m0.x; view.oy += m1.y - m0.y;
+  }
+  ptrs.set(e.pointerId, cur); drawPlan();
+});
+['pointerup', 'pointercancel'].forEach(ev => cv.addEventListener(ev, e => ptrs.delete(e.pointerId)));
+cv.addEventListener('wheel', e => { e.preventDefault(); zoomAt(e.offsetX, e.offsetY, e.deltaY < 0 ? 1.15 : 1 / 1.15); drawPlan(); }, { passive: false });
+$('zin').onclick = () => { zoomAt(cv.clientWidth / 2, cv.clientHeight / 2, 1.4); drawPlan(); };
+$('zout').onclick = () => { zoomAt(cv.clientWidth / 2, cv.clientHeight / 2, 1 / 1.4); drawPlan(); };
+$('zfit').onclick = fitPlan;
+
+// ---------- DXF (мм) ----------
+$('dxf').onclick = () => {
+  if (!pts.length) return;
+  const q = pts.map(p => [Math.round(p.x * scaleK * 1000), Math.round(-p.z * scaleK * 1000), Math.round(p.y * scaleK * 1000)]);
+  let s = '0\nSECTION\n2\nENTITIES\n';
+  if (mode === 'room' && q.length >= 2) {
+    s += '0\nPOLYLINE\n8\n0\n66\n1\n70\n' + (closed ? 1 : 0) + '\n';
+    q.forEach(v => { s += '0\nVERTEX\n8\n0\n10\n' + v[0] + '\n20\n' + v[1] + '\n30\n0\n'; });
+    s += '0\nSEQEND\n8\n0\n';
+  } else if (q.length >= 2) {
+    const a = q[q.length - 2], b = q[q.length - 1];
+    s += '0\nLINE\n8\n0\n10\n' + a[0] + '\n20\n' + a[1] + '\n30\n' + a[2] + '\n11\n' + b[0] + '\n21\n' + b[1] + '\n31\n' + b[2] + '\n';
+  }
+  s += '0\nENDSEC\n0\nEOF\n';
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([s], { type: 'application/dxf' }));
+  a.download = 'room.dxf';
+  a.click();
+};
 
 renderer.setAnimationLoop((t, frame) => {
   if (frame && session) {
@@ -252,7 +403,13 @@ function updateLive() {
 
 function redraw() {
   while (group.children.length) group.remove(group.children[0]);
-  pts.forEach(p => { const s = new THREE.Mesh(sphereGeom, sphereMat); s.position.copy(p); group.add(s); });
+  if (sel >= pts.length) sel = pts.length - 1;
+  pts.forEach((p, i) => {
+    const s = new THREE.Mesh(sphereGeom, i === sel ? selMat : sphereMat);
+    s.position.copy(p);
+    if (i === sel) s.scale.setScalar(1.4);
+    group.add(s);
+  });
   if (pts.length >= 2) {
     const arr = pts.slice();
     if (closed) arr.push(pts[0]);
@@ -276,10 +433,49 @@ $('put').onclick = () => {
   if (closed) return;
   if (mode === 'dist' && pts.length >= 2) pts = [];
   pts.push(hitPos.clone());
+  sel = pts.length - 1;
   redraw();
 };
-$('undo').onclick = () => { closed = false; pts.pop(); redraw(); };
-$('reset').onclick = () => { pts = []; closed = false; redraw(); };
+$('undo').onclick = () => { closed = false; pts.pop(); sel = pts.length - 1; redraw(); };
+$('reset').onclick = () => { pts = []; closed = false; sel = -1; redraw(); };
+
+// ---------- подстройка выбранной точки ----------
+$('nudge').onclick = () => {
+  const p = $('pad');
+  p.style.display = p.style.display === 'none' ? 'grid' : 'none';
+  $('nudge').classList.toggle('active', p.style.display !== 'none');
+};
+const STEPS = [10, 1, 50];
+$('step').onclick = () => {
+  stepMm = STEPS[(STEPS.indexOf(stepMm) + 1) % STEPS.length];
+  $('step').textContent = 'шаг ' + stepMm + ' мм';
+};
+$('prevPt').onclick = () => { if (pts.length) { sel = (sel - 1 + pts.length) % pts.length; redraw(); } };
+$('nextPt').onclick = () => { if (pts.length) { sel = (sel + 1) % pts.length; redraw(); } };
+
+const UP = new THREE.Vector3(0, 1, 0);
+function nudge(dir) {
+  if (sel < 0 || sel >= pts.length) return;
+  const f = new THREE.Vector3();
+  renderer.xr.getCamera().getWorldDirection(f);
+  f.y = 0;
+  if (f.lengthSq() < 1e-6) f.set(0, 0, -1);
+  f.normalize();
+  const r = new THREE.Vector3().crossVectors(f, UP);        // вправо относительно взгляда
+  const v = { left: r.clone().negate(), right: r, fwd: f, back: f.clone().negate(), up: UP, down: UP.clone().negate() }[dir];
+  pts[sel].addScaledVector(v, stepMm / 1000 / scaleK);
+  redraw();
+}
+document.querySelectorAll('#pad [data-d]').forEach(b => {
+  let t1 = null, t2 = null;
+  const stop = () => { clearTimeout(t1); clearInterval(t2); };
+  b.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    nudge(b.dataset.d);
+    t1 = setTimeout(() => { t2 = setInterval(() => nudge(b.dataset.d), 90); }, 350);
+  });
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => b.addEventListener(ev, stop));
+});
 $('close').onclick = () => { if (pts.length >= 3) { closed = true; redraw(); } };
 $('mDist').onclick = () => { mode = 'dist'; pts = []; closed = false; redraw(); };
 $('mRoom').onclick = () => { mode = 'room'; pts = []; closed = false; redraw(); };
