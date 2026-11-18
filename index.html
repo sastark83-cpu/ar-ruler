@@ -66,6 +66,7 @@
     <div id="bottom">
       <button id="put">＋ Поставить точку</button>
       <button class="sec" id="nudge">Подстройка</button>
+      <button class="sec" id="hitMode">Привязка: плоск.+точки</button>
       <button class="sec active" id="mDist">Длина</button>
       <button class="sec" id="mRoom">Комната</button>
       <button class="sec" id="mPart">Деталь</button>
@@ -189,7 +190,7 @@ const OPCOL = { door: '#f59e0b', window: '#22d3ee' };
 const OPNAME = { door: 'Дверь', window: 'Окно' };
 
 // ---------- WebXR ----------
-let session = null, hitSource = null, hitRequested = false;
+let session = null, hitSource = null, hitRequested = false, placeReq = false, anchDirty = false;
 const hitPos = new THREE.Vector3();
 
 async function start() {
@@ -200,13 +201,14 @@ async function start() {
   try {
     session = await navigator.xr.requestSession('immersive-ar', {
       requiredFeatures: ['hit-test'],
-      optionalFeatures: ['dom-overlay', 'local-floor'],
+      optionalFeatures: ['dom-overlay', 'local-floor', 'anchors'],
       domOverlay: { root: ui }
     });
   } catch (e) { $('err').textContent = 'Не удалось запустить: ' + e.message; return; }
   renderer.xr.setReferenceSpaceType('local');
   await renderer.xr.setSession(session);
-  hitRequested = false; hitSource = null;
+  resetAll();                                  // новая AR-сессия = новая система координат, старые точки не годятся
+  hitRequested = false; hitSource = null; viewerSpace = null; placeReq = false;
   session.addEventListener('end', onEnd);
   $('start').style.display = 'none';
   $('result').style.display = 'none';
@@ -231,16 +233,31 @@ function onEnd() {
   fitPlan();
 }
 
+// положения точек берём у якорей ARCore (если они есть), чтобы метки не «плыли» относительно предметов
+function syncAnchors(frame, ref) {
+  const all = [...pts, ...cp, opTmp, ...ops.flatMap(o => [o.a, o.b])];
+  for (const p of all) {
+    if (!p || !p._anchor) continue;
+    let pose = null;
+    try { pose = frame.getPose(p._anchor.anchorSpace, ref); } catch (err) { p._anchor = null; }
+    if (!pose) continue;
+    const t = pose.transform.position;
+    if (Math.abs(t.x - p.x) + Math.abs(t.y - p.y) + Math.abs(t.z - p.z) > 0.002) { p.set(t.x, t.y, t.z); anchDirty = true; }
+  }
+}
+
 let frames = 0;
 renderer.setAnimationLoop((t, frame) => {
   if (frame && session) {
-    if (++frames % 20 === 0) { dbgState = 'кадры ' + frames + ' hit=' + !!hitSource + ' кольцо=' + reticle.visible + ' точек=' + pts.length; dbg(); }
     const ref = renderer.xr.getReferenceSpace();
-    if (!hitRequested) {
-      hitRequested = true;
-      session.requestReferenceSpace('viewer').then(vs =>
-        session.requestHitTestSource({ space: vs }).then(src => { hitSource = src; }));
+    if (!hitRequested) { hitRequested = true; requestHit(); }
+    syncAnchors(frame, ref);
+    if (++frames % 20 === 0) {
+      const na = [...pts, ...cp, opTmp, ...ops.flatMap(o => [o.a, o.b])].filter(p => p && p._anchor).length;
+      dbgState = 'кадры ' + frames + ' hit=' + !!hitSource + ' кольцо=' + reticle.visible + ' точек=' + pts.length + ' якорей=' + na + ' типы=' + hitTypes.join('+');
+      dbg();
     }
+    if (anchDirty && frames % 6 === 0) { anchDirty = false; redraw(); }
     if (hitSource) {
       const res = frame.getHitTestResults(hitSource);
       if (res.length) {
@@ -249,9 +266,11 @@ renderer.setAnimationLoop((t, frame) => {
         reticle.matrix.fromArray(pose.transform.matrix);
         hitPos.setFromMatrixPosition(reticle.matrix);
         updateLive();
+        if (placeReq) { placeReq = false; doPlace(res[0]); }
       } else {
         reticle.visible = false;
         liveLine.visible = false;
+        placeReq = false;
         $('live').textContent = 'Наведи на поверхность';
       }
     }
@@ -506,27 +525,53 @@ $('go').onclick = start;
 $('put').onclick = () => {
   dbg('put: кольцо=' + reticle.visible);
   if (!reticle.visible) { $('live').textContent = 'Нет поверхности: подвигай телефоном, наведи на стену или пол'; return; }
+  placeReq = true;      // сама постановка — в следующем кадре, по свежему результату hit-test
+};
+
+// Точка «приклеивается» к реальному миру через якорь ARCore: при поправках трекинга она не уплывает
+function attach(v, hr) {
+  if (!hr || !hr.createAnchor) return;
+  hr.createAnchor().then(a => { v._anchor = a; }).catch(err => dbg('якорь: ' + err.message));
+}
+function doPlace(hr) {
   try { const e = new THREE.Vector3(); renderer.xr.getCamera().getWorldPosition(e); eyeSum.add(e); eyeN++; }
   catch (err) { dbg('eye: ' + err.message); }
   if (mode === 'room' && phase === 'ceil') {
-    if (ci < pts.length) { cp[ci] = hitPos.clone(); sel = ci; ci++; redraw(); }
+    if (ci < pts.length) { cp[ci] = hitPos.clone(); attach(cp[ci], hr); sel = ci; ci++; redraw(); }
     return;
   }
   if (mode === 'room' && phase === 'open') {
-    if (!opTmp) opTmp = hitPos.clone();
-    else { ops.push({ type: opType, a: opTmp, b: hitPos.clone() }); opTmp = null; }
+    if (!opTmp) { opTmp = hitPos.clone(); attach(opTmp, hr); }
+    else { const b = hitPos.clone(); attach(b, hr); ops.push({ type: opType, a: opTmp, b }); opTmp = null; }
     redraw();
     return;
   }
-  if (mode === 'dist') { if (pts.length >= 2) pts = []; pts.push(hitPos.clone()); }
-  else if (mode === 'room') { if (closed) return; pts.push(hitPos.clone()); }
+  const v = hitPos.clone(); attach(v, hr);
+  if (mode === 'dist') { if (pts.length >= 2) pts = []; pts.push(v); }
+  else if (mode === 'room') { if (closed) return; pts.push(v); }
   else {
     let c = cont[cont.length - 1];
     if (c.closed) { c = { idx: [], closed: false }; cont.push(c); }
-    pts.push(hitPos.clone()); c.idx.push(pts.length - 1);
+    pts.push(v); c.idx.push(pts.length - 1);
   }
   sel = pts.length - 1;
   redraw();
+}
+
+// какие объекты ловит луч из центра экрана: плоскости и/или опорные точки
+let hitTypes = ['plane', 'point'];
+let viewerSpace = null;
+function requestHit() {
+  if (!session) return;
+  if (hitSource) { try { hitSource.cancel(); } catch (e) { /* ignore */ } hitSource = null; }
+  const go = vs => session.requestHitTestSource({ space: vs, entityTypes: hitTypes }).then(s => { hitSource = s; })
+    .catch(err => { dbg('hit: ' + err.message); return session.requestHitTestSource({ space: vs }).then(s => { hitSource = s; }); });
+  if (viewerSpace) go(viewerSpace); else session.requestReferenceSpace('viewer').then(vs => { viewerSpace = vs; go(vs); });
+}
+$('hitMode').onclick = () => {
+  hitTypes = hitTypes.length === 2 ? ['plane'] : ['plane', 'point'];
+  $('hitMode').textContent = 'Привязка: ' + (hitTypes.length === 2 ? 'плоск.+точки' : 'плоскости');
+  requestHit();
 };
 $('undo').onclick = () => {
   if (mode === 'room' && phase === 'ceil') { if (ci > 0) { ci--; cp[ci] = null; sel = ci - 1; } }
@@ -578,9 +623,10 @@ function nudge(dir) {
   const st = stepMm / 1000 / scaleK;
   if (mode === 'room' && phase === 'open') return;   // проём не двигаем: «Отмена» и поставить заново
   if (mode === 'room' && phase === 'ceil') {     // на потолке двигаем только по высоте
-    if (cp[sel] && (dir === 'up' || dir === 'down')) { cp[sel].y += dir === 'up' ? st : -st; redraw(); }
+    if (cp[sel] && (dir === 'up' || dir === 'down')) { cp[sel]._anchor = null; cp[sel].y += dir === 'up' ? st : -st; redraw(); }
     return;
   }
+  pts[sel]._anchor = null;                           // после ручной подстройки якорь больше не двигает точку
   const f = new THREE.Vector3();
   try { renderer.xr.getCamera().getWorldDirection(f); } catch (err) { f.set(0, 0, -1); }
   f.y = 0;
