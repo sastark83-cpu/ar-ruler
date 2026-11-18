@@ -53,6 +53,7 @@
     <div id="top">
       <div id="live">Наведи на поверхность</div>
       <div id="info"></div>
+      <div id="dbg" style="font:11px monospace;color:#7d8794;white-space:pre-wrap"></div>
     </div>
   </div>
 
@@ -111,6 +112,15 @@ import * as THREE from 'three';
 const $ = id => document.getElementById(id);
 const ui = $('ui');
 const UP = new THREE.Vector3(0, 1, 0);
+
+// ---------- диагностика (строка внизу панели сверху) ----------
+const dbgLog = []; let dbgState = '';
+function dbg(msg) {
+  if (msg) { dbgLog.push(msg); if (dbgLog.length > 4) dbgLog.shift(); }
+  const el = $('dbg'); if (el) el.textContent = dbgLog.join(' | ') + (dbgState ? '\n' + dbgState : '');
+}
+addEventListener('error', e => dbg('ERR ' + e.message));
+addEventListener('unhandledrejection', e => dbg('REJ ' + ((e.reason && e.reason.message) || e.reason)));
 
 // ---------- состояние ----------
 let mode = 'dist';      // dist | room | part
@@ -221,8 +231,10 @@ function onEnd() {
   fitPlan();
 }
 
+let frames = 0;
 renderer.setAnimationLoop((t, frame) => {
   if (frame && session) {
+    if (++frames % 20 === 0) { dbgState = 'кадры ' + frames + ' hit=' + !!hitSource + ' кольцо=' + reticle.visible + ' точек=' + pts.length; dbg(); }
     const ref = renderer.xr.getReferenceSpace();
     if (!hitRequested) {
       hitRequested = true;
@@ -492,8 +504,10 @@ function update() {
 // ---------- кнопки ----------
 $('go').onclick = start;
 $('put').onclick = () => {
-  if (!reticle.visible) return;
-  const e = new THREE.Vector3(); renderer.xr.getCamera().getWorldPosition(e); eyeSum.add(e); eyeN++;
+  dbg('put: кольцо=' + reticle.visible);
+  if (!reticle.visible) { $('live').textContent = 'Нет поверхности: подвигай телефоном, наведи на стену или пол'; return; }
+  try { const e = new THREE.Vector3(); renderer.xr.getCamera().getWorldPosition(e); eyeSum.add(e); eyeN++; }
+  catch (err) { dbg('eye: ' + err.message); }
   if (mode === 'room' && phase === 'ceil') {
     if (ci < pts.length) { cp[ci] = hitPos.clone(); sel = ci; ci++; redraw(); }
     return;
@@ -568,7 +582,7 @@ function nudge(dir) {
     return;
   }
   const f = new THREE.Vector3();
-  renderer.xr.getCamera().getWorldDirection(f);
+  try { renderer.xr.getCamera().getWorldDirection(f); } catch (err) { f.set(0, 0, -1); }
   f.y = 0;
   if (f.lengthSq() < 1e-6) f.set(0, 0, -1);
   f.normalize();
@@ -830,6 +844,22 @@ const base = () => ({ dist: 'length', room: 'room', part: 'part' }[mode]);
 $('dxf2').onclick = () => save(base() + '_2d.dxf', toDXF2D());
 $('dxf3').onclick = () => { const g = geom(); if (g) save(base() + '_3d.dxf', toDXF3D(g)); };
 $('obj').onclick = () => { const g = geom(); if (g) save(base() + '.obj', toOBJ(g)); };
+
+// Нажатия внутри AR (dom-overlay): ловим и pointerup, и click, защита от двойного срабатывания
+ui.addEventListener('beforexrselect', e => e.preventDefault());
+function tap(el, fn) {
+  let last = 0;
+  const h = e => {
+    const t = performance.now(); if (t - last < 400) return; last = t;
+    try { fn(e); } catch (err) { dbg('ERR ' + err.message); }
+  };
+  el.addEventListener('pointerup', h);
+  el.addEventListener('click', h);
+}
+document.querySelectorAll('button').forEach(b => {
+  const fn = b.onclick;
+  if (fn && b.id !== 'go') { b.onclick = null; tap(b, fn); }
+});
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
