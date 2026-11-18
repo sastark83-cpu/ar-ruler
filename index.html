@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>AR-рулетка</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #14171c; color: #eef1f5; font: 16px/1.4 system-ui, sans-serif; }
+  #ui { position: fixed; inset: 0; display: flex; flex-direction: column; justify-content: space-between; pointer-events: none; }
+  #ui > * { pointer-events: auto; }
+  #start { margin: auto; padding: 20px; max-width: 460px; text-align: center; }
+  #start h1 { margin: 0 0 8px; font-size: 24px; }
+  #start p { color: #a9b2bf; margin: 6px 0; font-size: 14px; }
+  button { font: inherit; border: 0; border-radius: 12px; padding: 12px 16px; background: #2d7ff9; color: #fff; }
+  button.sec { background: #2b313b; }
+  button.big { padding: 16px 28px; font-size: 18px; }
+  button.active { background: #19a974; }
+  #hud { display: none; }
+  #top { padding: 10px; background: rgba(10,12,16,.72); }
+  #live { font-size: 22px; font-weight: 600; }
+  #info { font-size: 13px; color: #cfd6e0; white-space: pre-line; max-height: 28vh; overflow: auto; }
+  #bottom { padding: 10px; display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; background: rgba(10,12,16,.72); }
+  #bottom button { flex: 1 1 28%; }
+  #put { flex: 1 1 100% !important; padding: 18px; font-size: 20px; background: #f59e0b; color: #111; }
+  #result { display: none; padding: 16px; overflow: auto; }
+  textarea { width: 100%; height: 160px; background: #0c0e12; color: #cfe; border: 1px solid #333; border-radius: 8px; font: 12px monospace; }
+  label { font-size: 14px; color: #a9b2bf; }
+  input[type=number] { width: 110px; padding: 8px; border-radius: 8px; border: 1px solid #333; background: #0c0e12; color: #fff; font: inherit; }
+  .row { display: flex; gap: 8px; align-items: center; justify-content: center; margin: 10px 0; }
+  #err { color: #ff8a8a; font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div id="start">
+    <h1>AR-рулетка</h1>
+    <p>Тест точности на ARCore. Нужен Chrome на Android, свет и поверхности с фактурой.</p>
+    <div class="row">
+      <label>Поправочный коэффициент <input type="number" id="scale" step="0.001" value="1"></label>
+    </div>
+    <button class="big" id="go">Запустить AR</button>
+    <p id="err"></p>
+  </div>
+
+  <div id="hud">
+    <div id="top">
+      <div id="live">Наведи на поверхность</div>
+      <div id="info"></div>
+    </div>
+  </div>
+
+  <div id="hud2" style="display:none">
+    <div id="bottom">
+      <button id="put">＋ Поставить точку</button>
+      <button class="sec active" id="mDist">Длина</button>
+      <button class="sec" id="mRoom">Комната</button>
+      <button class="sec" id="undo">Отмена</button>
+      <button class="sec" id="close">Замкнуть</button>
+      <button class="sec" id="reset">Сброс</button>
+      <button class="sec" id="exit">Выход</button>
+    </div>
+  </div>
+
+  <div id="result">
+    <h2 style="margin-top:0">Результат</h2>
+    <div id="resText" style="white-space:pre-line"></div>
+    <p><label>JSON (точки в мм)</label></p>
+    <textarea id="json" readonly></textarea>
+    <div class="row">
+      <button class="big" id="again">Измерять дальше</button>
+    </div>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+const $ = id => document.getElementById(id);
+const ui = $('ui');
+
+// ---------- состояние ----------
+let mode = 'dist';      // dist | room
+let pts = [];           // THREE.Vector3 (метры, система координат сессии)
+let closed = false;
+let scaleK = parseFloat(localStorage.getItem('scaleK') || '1') || 1;
+$('scale').value = scaleK;
+$('scale').addEventListener('change', () => {
+  scaleK = parseFloat($('scale').value) || 1;
+  localStorage.setItem('scaleK', scaleK);
+});
+
+// ---------- three ----------
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.01, 30);
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+renderer.domElement.style.cssText = 'position:fixed;inset:0;z-index:-1';
+document.body.appendChild(renderer.domElement);
+
+const reticle = new THREE.Mesh(
+  new THREE.RingGeometry(0.035, 0.05, 32).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ color: 0xf59e0b })
+);
+reticle.matrixAutoUpdate = false;
+reticle.visible = false;
+scene.add(reticle);
+
+const group = new THREE.Group();
+scene.add(group);
+
+const liveGeom = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+const liveLine = new THREE.Line(liveGeom, new THREE.LineBasicMaterial({ color: 0xffffff }));
+liveLine.frustumCulled = false;
+liveLine.visible = false;
+scene.add(liveLine);
+
+const sphereGeom = new THREE.SphereGeometry(0.012, 16, 12);
+const sphereMat = new THREE.MeshBasicMaterial({ color: 0x19a974 });
+const lineMat = new THREE.LineBasicMaterial({ color: 0x2d7ff9 });
+
+// ---------- WebXR ----------
+let session = null, hitSource = null, hitRequested = false;
+const hitPos = new THREE.Vector3();
+
+async function start() {
+  $('err').textContent = '';
+  if (!navigator.xr) { $('err').textContent = 'WebXR недоступен. Нужен Chrome на Android и HTTPS.'; return; }
+  const ok = await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
+  if (!ok) { $('err').textContent = 'immersive-ar не поддерживается (нет ARCore / «Службы Google Play для AR»?).'; return; }
+  try {
+    session = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['hit-test'],
+      optionalFeatures: ['dom-overlay', 'local-floor'],
+      domOverlay: { root: ui }
+    });
+  } catch (e) { $('err').textContent = 'Не удалось запустить: ' + e.message; return; }
+  renderer.xr.setReferenceSpaceType('local');
+  await renderer.xr.setSession(session);
+  hitRequested = false; hitSource = null;
+  session.addEventListener('end', onEnd);
+  $('start').style.display = 'none';
+  $('result').style.display = 'none';
+  $('hud').style.display = 'block';
+  $('hud2').style.display = 'block';
+  ui.style.background = 'transparent';
+  document.body.style.background = 'transparent';
+  update();
+}
+
+function onEnd() {
+  session = null; hitSource = null; hitRequested = false;
+  reticle.visible = false; liveLine.visible = false;
+  $('hud').style.display = 'none';
+  $('hud2').style.display = 'none';
+  ui.style.background = '';
+  document.body.style.background = '';
+  const s = summary();
+  $('resText').textContent = s.text || 'Точек нет.';
+  $('json').value = JSON.stringify(s.json, null, 1);
+  $('result').style.display = 'block';
+}
+
+renderer.setAnimationLoop((t, frame) => {
+  if (frame && session) {
+    const ref = renderer.xr.getReferenceSpace();
+    if (!hitRequested) {
+      hitRequested = true;
+      session.requestReferenceSpace('viewer').then(vs =>
+        session.requestHitTestSource({ space: vs }).then(src => { hitSource = src; }));
+    }
+    if (hitSource) {
+      const res = frame.getHitTestResults(hitSource);
+      if (res.length) {
+        const pose = res[0].getPose(ref);
+        reticle.visible = true;
+        reticle.matrix.fromArray(pose.transform.matrix);
+        hitPos.setFromMatrixPosition(reticle.matrix);
+        updateLive();
+      } else {
+        reticle.visible = false;
+        liveLine.visible = false;
+        $('live').textContent = 'Наведи на поверхность';
+      }
+    }
+  }
+  renderer.render(scene, camera);
+});
+
+// ---------- расчёты ----------
+const m = v => v * scaleK;                       // метры с поправкой
+const fmt = v => { v = m(v); return v.toFixed(3) + ' м (' + Math.round(v * 1000) + ' мм)'; };
+const flat = (a, b) => Math.hypot(a.x - b.x, a.z - b.z);
+
+function polyArea(p) {                           // шоелейс по XZ
+  let s = 0;
+  for (let i = 0; i < p.length; i++) {
+    const a = p[i], b = p[(i + 1) % p.length];
+    s += a.x * b.z - b.x * a.z;
+  }
+  return Math.abs(s) / 2;
+}
+
+function summary() {
+  const lines = [];
+  const json = { scale: scaleK, mode, closed, points_mm: pts.map(p => [p.x, p.y, p.z].map(v => Math.round(m(v) * 1000))) };
+  if (pts.length >= 2) {
+    if (mode === 'dist') {
+      const a = pts[pts.length - 2], b = pts[pts.length - 1];
+      lines.push('Расстояние 3D: ' + fmt(a.distanceTo(b)));
+      lines.push('По горизонтали: ' + fmt(flat(a, b)));
+      lines.push('По вертикали: ' + fmt(Math.abs(a.y - b.y)));
+      json.distance_mm = Math.round(m(a.distanceTo(b)) * 1000);
+    } else {
+      const n = closed ? pts.length : pts.length - 1;
+      let per = 0;
+      for (let i = 0; i < n; i++) {
+        const a = pts[i], b = pts[(i + 1) % pts.length];
+        const d = flat(a, b); per += d;
+        lines.push('Стена ' + (i + 1) + ': ' + fmt(d));
+      }
+      lines.push('Периметр: ' + fmt(per));
+      const ys = pts.map(p => p.y);
+      lines.push('Разброс высот точек: ' + fmt(Math.max(...ys) - Math.min(...ys)));
+      if (closed && pts.length >= 3) {
+        const A = polyArea(pts) * scaleK * scaleK;
+        lines.push('Площадь: ' + A.toFixed(2) + ' м²');
+        json.area_m2 = +A.toFixed(3);
+      }
+      json.perimeter_mm = Math.round(m(per) * 1000);
+    }
+  }
+  return { text: lines.join('\n'), json };
+}
+
+function updateLive() {
+  if (!pts.length || (mode === 'dist' && pts.length >= 2) || closed) { liveLine.visible = false; $('live').textContent = pts.length ? 'Готово' : 'Ставь первую точку'; return; }
+  const last = pts[pts.length - 1];
+  const pa = liveGeom.attributes.position;
+  pa.setXYZ(0, last.x, last.y, last.z);
+  pa.setXYZ(1, hitPos.x, hitPos.y, hitPos.z);
+  pa.needsUpdate = true;
+  liveLine.visible = true;
+  $('live').textContent = fmt(last.distanceTo(hitPos));
+}
+
+function redraw() {
+  while (group.children.length) group.remove(group.children[0]);
+  pts.forEach(p => { const s = new THREE.Mesh(sphereGeom, sphereMat); s.position.copy(p); group.add(s); });
+  if (pts.length >= 2) {
+    const arr = pts.slice();
+    if (closed) arr.push(pts[0]);
+    group.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(arr), lineMat));
+  }
+  $('info').textContent = summary().text;
+  update();
+}
+
+function update() {
+  $('mDist').classList.toggle('active', mode === 'dist');
+  $('mRoom').classList.toggle('active', mode === 'room');
+  $('close').style.display = mode === 'room' ? '' : 'none';
+  if (!pts.length) $('live').textContent = 'Ставь первую точку';
+}
+
+// ---------- кнопки ----------
+$('go').onclick = start;
+$('put').onclick = () => {
+  if (!reticle.visible) return;
+  if (closed) return;
+  if (mode === 'dist' && pts.length >= 2) pts = [];
+  pts.push(hitPos.clone());
+  redraw();
+};
+$('undo').onclick = () => { closed = false; pts.pop(); redraw(); };
+$('reset').onclick = () => { pts = []; closed = false; redraw(); };
+$('close').onclick = () => { if (pts.length >= 3) { closed = true; redraw(); } };
+$('mDist').onclick = () => { mode = 'dist'; pts = []; closed = false; redraw(); };
+$('mRoom').onclick = () => { mode = 'room'; pts = []; closed = false; redraw(); };
+$('exit').onclick = () => session && session.end();
+$('again').onclick = start;
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+update();
+</script>
+</body>
+</html>
